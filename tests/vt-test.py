@@ -9,6 +9,7 @@ types a wrong password, then the right one. The real keyboards are grabbed
 meanwhile, so what the person at the machine types does not mix in. The
 test user is deleted afterwards and the original VT restored.
 """
+import errno
 import fcntl
 import glob
 import os
@@ -33,7 +34,7 @@ KEYS = (KEY_A, KEY_C, KEY_ENTER, KEY_F1, KEY_LEFTCTRL, KEY_LEFTALT,
         *DIGIT_KEYS.values())
 UI_SET_EVBIT, UI_SET_KEYBIT = 0x40045564, 0x40045565
 UI_DEV_SETUP, UI_DEV_CREATE, UI_DEV_DESTROY = 0x405C5503, 0x5501, 0x5502
-VT_GETSTATE, VT_ACTIVATE = 0x5603, 0x5606
+VT_ACTIVATE = 0x5606
 EVENT = struct.Struct("llHHi")
 
 
@@ -96,9 +97,15 @@ def active_vt():
 
 
 def allocated(vt):
-    with open("/dev/tty0", "rb") as tty0:
-        state = struct.unpack("HHH", fcntl.ioctl(tty0, VT_GETSTATE, bytes(6)))[2]
-    return bool(state >> vt & 1) if vt < 16 else None
+    """Has the kernel allocated VT `vt`? (VT_GETSTATE's bitmask covers only
+    VTs below 16; /dev/vcsN of a free VT fails with ENXIO or is gone.)"""
+    try:
+        os.close(os.open(f"/dev/vcs{vt}", os.O_RDONLY))
+        return True
+    except OSError as e:
+        if e.errno in (errno.ENXIO, errno.ENOENT):
+            return False
+        raise
 
 
 def wait(predicate, seconds):
@@ -149,6 +156,9 @@ def main():
         failures += check("lock VT in front",
                           wait(lambda: active_vt() != VT, 5), True)
         lock_vt = active_vt()
+        # Above logind's autovt range, where a getty would hang it up.
+        failures += check("lock VT taken from the top (>= 13)", lock_vt >= 13,
+                          True)
 
         chord(kb, KEY_LEFTCTRL, KEY_LEFTALT, KEY_F1)
         with open("/dev/tty0", "rb") as tty0:

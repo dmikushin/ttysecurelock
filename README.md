@@ -21,7 +21,9 @@ compiler and libpam.
 - It must start as root, normally from a hotkey daemon. The locked user is
   the owner of the active VT, or `--user NAME`. Root-owned VTs (login
   prompts) are refused.
-- A free VT is allocated, put in `VT_PROCESS` mode (the kernel asks us before
+- A free VT is taken from the top (63 down to 13: above logind's autovt
+  range, where switching to a VT makes logind start a getty that would hang
+  it up), put in `VT_PROCESS` mode (the kernel asks us before
   every switch away, and we refuse) and brought to the front; switching is
   also disabled with `VT_LOCKSWITCH`. Ctrl+Alt+Fn and `chvt` / `VT_ACTIVATE`,
   even from root, cannot leave it.
@@ -32,7 +34,8 @@ compiler and libpam.
 - Each attempt runs `authproto_pam` as the locked user, with a clean
   environment, and talks the xsecurelock protocol to it. Exit status 0 is
   success, as in xsecurelock. Then the previous VT comes back and the lock VT
-  is freed.
+  is freed (the mouse selection is handed to the console in front first: a
+  console mouse daemon's pointer would otherwise keep the lock VT busy).
 
 Running as root, the lock cannot be killed or signalled by the user's own
 processes — stronger than xsecurelock in X, where any process of the user can
@@ -69,11 +72,10 @@ and that the right one does and frees the lock VT.
 
 ## Hooking it to a hotkey
 
-[tty-i3-keys](https://github.com/dmikushin/tty-i3-keys) binds Win+Escape to a
-vlock-based lock. To use ttysecurelock instead, its Win+Escape handler would
-run, as root and detached from the daemon (its own session and cgroup, e.g.
-`systemd-run --scope`), `/usr/local/bin/ttysecurelock` while the user's VT is
-in front; the program finds the user from the VT owner.
+[tty-i3-keys](https://github.com/dmikushin/tty-i3-keys) binds Win+Escape to
+it: as root, in a transient scope of its own (`systemd-run --scope`, so
+restarting the hotkey daemon leaves the lock alone), with `--user` set to
+the owner of the VT in front.
 
 ## License
 

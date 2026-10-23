@@ -39,6 +39,7 @@ limitations under the License.
 #include <fcntl.h>
 #include <getopt.h>
 #include <grp.h>
+#include <linux/tiocl.h>
 #include <linux/vt.h>
 #include <locale.h>
 #include <poll.h>
@@ -59,6 +60,10 @@ limitations under the License.
 #include "logging.h"
 #include "mlock_page.h"
 #include "util.h"
+
+// The lock VT is taken from this range, top down (see FreeHighVT).
+#define MAX_LOCK_VT 63
+#define MIN_LOCK_VT 13
 
 #define INPUT_MAX_BYTES 256
 
@@ -361,6 +366,24 @@ static int BringToFront(int tty0) {
   return 0;
 }
 
+/*! \brief Make the console in front own the mouse selection.
+ *
+ * The kernel will not free the console that owns the selection, and a
+ * console mouse daemon (gpm, console-mouse) drawing its pointer on the lock
+ * VT makes that VT the owner: put a pointer on the console in front and
+ * clear it at once.
+ */
+static void HandOverSelection(int tty0) {
+  for (unsigned short mode = TIOCL_SELPOINTER; mode <= TIOCL_SELCLEAR;
+       ++mode) {
+    unsigned short sel[5] = {1, 1, 1, 1, mode};
+    char arg[1 + sizeof(sel)];
+    arg[0] = TIOCL_SETSEL;
+    memcpy(arg + 1, sel, sizeof(sel));
+    ioctl(tty0, TIOCLINUX, arg);
+  }
+}
+
 /*! \brief Undo the lock VT: switching, mode, terminal, and, if unlocked,
  * go back to the previous VT and free the lock VT. */
 static void Release(int tty0, int go_back) {
@@ -374,10 +397,37 @@ static void Release(int tty0, int go_back) {
     for (int i = 0; i < 40 && ActiveVT(tty0) != orig_vt; ++i) usleep(50000);
   }
   close(vt_fd);
+  if (go_back) HandOverSelection(tty0);
   // Another program may still hold the lock VT open for a moment.
   for (int i = 0; i < 10 && ioctl(tty0, VT_DISALLOCATE, lock_vt) < 0; ++i) {
     usleep(100000);
   }
+}
+
+/*! \brief A free VT for the lock, from the top (63) down to 13.
+ *
+ * Not VT_OPENQRY's first free VT: that is usually within logind's autovt
+ * range (NAutoVTs, 6 by default), and switching to it makes logind start a
+ * getty there, which hangs the lock VT up. A VT is free if the kernel has
+ * not allocated it: /dev/vcsN of an unallocated VT fails with ENXIO (or is
+ * missing), and, unlike /dev/ttyN, opening it allocates nothing.
+ *
+ * \return the VT number, or -1.
+ */
+static int FreeHighVT(void) {
+  for (int n = MAX_LOCK_VT; n >= MIN_LOCK_VT; --n) {
+    char path[32];
+    snprintf(path, sizeof(path), "/dev/tty%d", n);
+    if (access(path, F_OK) < 0) continue;
+    snprintf(path, sizeof(path), "/dev/vcs%d", n);
+    int fd = open(path, O_RDONLY | O_NOCTTY | O_CLOEXEC);
+    if (fd >= 0) {
+      close(fd);  // allocated: in use
+      continue;
+    }
+    if (errno == ENXIO || errno == ENOENT) return n;
+  }
+  return -1;
 }
 
 static int OpenTty(int n) {
@@ -479,7 +529,8 @@ int main(int argc, char **argv) {
   locked.pw_name = strdup(pw->pw_name);
   locked.pw_dir = strdup(pw->pw_dir);
 
-  if (ioctl(tty0, VT_OPENQRY, &lock_vt) < 0 || lock_vt <= 0) {
+  lock_vt = FreeHighVT();
+  if (lock_vt <= 0) {
     Log("No free VT");
     return 1;
   }
