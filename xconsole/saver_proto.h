@@ -37,7 +37,7 @@ limitations under the License.
 #include <stdint.h>
 
 #define XC_SAVER_MAGIC 0x56534358u  // "XCSV"
-#define XC_SAVER_VERSION 1u
+#define XC_SAVER_VERSION 2u
 #define XC_SAVER_MAX_MSG 65536
 #define XC_SAVER_MAX_CELLS ((XC_SAVER_MAX_MSG - 8) / 12)
 
@@ -65,8 +65,15 @@ typedef struct {
 typedef struct {
   uint16_t col, row;
   uint32_t cp;  // Unicode code point; anything not printable shows as ' '
-  uint8_t fg, bg;  // console colours 0-15
+  uint8_t fg, bg;  // console colours 0-15, or XC_SAVER_RAMP + level
   uint8_t pad[2];
 } XcSaverCell;
+
+/*! The lock's green ramp, for the Matrix rain: XC_SAVER_RAMP + 0 is the
+ * brightest (a trail's head), + XC_SAVER_RAMP_LEVELS - 1 the darkest. The
+ * lock shows it with palette entries of the lock VT that it sets while the
+ * saver shows (display.c, XcSetRampLocked). */
+#define XC_SAVER_RAMP 16
+#define XC_SAVER_RAMP_LEVELS 6
 
 #endif

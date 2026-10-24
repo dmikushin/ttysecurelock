@@ -89,6 +89,9 @@ typedef struct {
   // auth window to blank the saver window at once (display.c). The saver
   // channel's checks use the main program's own copies, not these.
   Window saver_window, auth_window;
+  // Whether the lock VT's palette entries 1-6 hold the saver's green ramp
+  // (display.c, XcSetRampLocked).
+  int ramp_on;
 } XcShared;
 
 //! Per-process connection.
@@ -146,6 +149,9 @@ int XcWindowCellsLocked(const XcWindow *w, int *c0, int *r0, int *c1,
 //! cell) where the window is visible: the listed ones, or all if n < 0.
 void XcPaintGridLocked(const XcWindow *w, int cols, int rows,
                        const XcGridCell *grid, const uint32_t *list, int n);
+//! The green ramp of the saver channel (saver_proto.h) on the lock VT's
+//! palette entries 1-6 (on), or those entries back as they were (off).
+void XcSetRampLocked(int on);
 //! Whether a code point may be put in a cell as is (one cell, printable).
 int XcPrintableCell(uint32_t cp);
 

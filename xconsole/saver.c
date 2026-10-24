@@ -132,6 +132,7 @@ static int UpdateConn(Conn *c) {
   // on, the lock keeps its cells and shows them when the prompt is gone.
   XcWindow *auth = XcFindWindow(xc_auth_window);
   int hide = auth != NULL && XcViewable(auth);
+  if (hide) XcSetRampLocked(0);
   if (hide && !c->hidden) {
     XcGridCell *blank = calloc((size_t)(c->cols * c->rows) + 1, sizeof(*blank));
     if (blank == NULL) return 0;
@@ -143,7 +144,9 @@ static int UpdateConn(Conn *c) {
     XcPaintGridLocked(win, c->cols, c->rows, blank, NULL, -1);
     free(blank);
   }
-  if (!hide && (c->hidden || c->damage != xc.shm->damage)) {
+  if (!hide && (c->hidden || c->damage != xc.shm->damage ||
+                !xc.shm->ramp_on)) {
+    XcSetRampLocked(1);
     XcPaintGridLocked(win, c->cols, c->rows, c->grid, NULL, -1);
   }
   c->hidden = hide;
@@ -244,8 +247,8 @@ static int Receive(int i, char *buf) {
     uint32_t idx = (uint32_t)cell.row * (uint32_t)c->cols + cell.col;
     XcGridCell *g = &c->grid[idx];
     g->cp = XcPrintableCell(cell.cp) ? cell.cp : ' ';
-    g->fg = cell.fg & 15;
-    g->bg = cell.bg & 15;
+    g->fg = cell.fg < XC_SAVER_RAMP + XC_SAVER_RAMP_LEVELS ? cell.fg : 7;
+    g->bg = cell.bg < XC_SAVER_RAMP + XC_SAVER_RAMP_LEVELS ? cell.bg : 0;
     list[m++] = idx;
   }
   if (ok && m > 0 && !c->hidden) {
@@ -311,5 +314,6 @@ int XcSaverServerStart(void) {
 void XcSaverServerStop(void) {
   XcLock();
   stopping = 1;
+  XcSetRampLocked(0);
   XcUnlock();
 }

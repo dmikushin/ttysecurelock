@@ -46,6 +46,7 @@ limitations under the License.
 #include <wchar.h>
 
 #include "../logging.h"
+#include "saver_proto.h"
 #include "xconsole_internal.h"
 
 #define DISPLAY_PREFIX ":xconsole:"
@@ -171,6 +172,7 @@ typedef struct {
 
 static PaintEntry paint[XC_MAX_WINDOWS];
 static int CellWidth(unsigned int cp);
+static unsigned long NearestColor(int r, int g, int b);
 static int npaint;
 
 static int Viewable(const XcWindow *w) {
@@ -366,6 +368,39 @@ static size_t PutUtf8(char *buf, uint32_t cp) {
   return 4;
 }
 
+// The saver channel's green ramp (saver_proto.h), brightest first: a
+// near-white green for the head of a trail, then greens darker and darker,
+// the last one barely above black. Shown with palette entries 1-6 of the lock
+// VT, set with the console's own escape (ESC ] P n rrggbb), which changes
+// that VT's palette only, never the other consoles' (PIO_CMAP would).
+#define RAMP_FIRST 1
+static const unsigned char ramp_rgb[XC_SAVER_RAMP_LEVELS][3] = {
+    {0xd0, 0xff, 0xd0}, {0x30, 0xf0, 0x30}, {0x10, 0xc0, 0x10},
+    {0x08, 0x90, 0x08}, {0x04, 0x60, 0x04}, {0x02, 0x38, 0x02}};
+
+void XcSetRampLocked(int on) {
+  if (xc.shm->ramp_on == on) return;
+  char buf[XC_SAVER_RAMP_LEVELS * 12];
+  size_t len = 0;
+  for (int k = 0; k < XC_SAVER_RAMP_LEVELS; ++k) {
+    const unsigned char *rgb = on ? ramp_rgb[k] : xc.shm->palette[RAMP_FIRST + k];
+    len += (size_t)sprintf(buf + len, "\033]P%X%02x%02x%02x", RAMP_FIRST + k,
+                           rgb[0], rgb[1], rgb[2]);
+  }
+  Out(buf, len);
+  xc.shm->ramp_on = on;
+}
+
+//! A saver cell's colour as a console colour: the ramp's entries while it
+//! is on, else the console colour nearest to the ramp colour.
+static unsigned long SaverColor(uint8_t c) {
+  if (c < 16) return c;
+  int k = c - XC_SAVER_RAMP;
+  if (k < 0 || k >= XC_SAVER_RAMP_LEVELS) return 7;
+  if (xc.shm->ramp_on) return (unsigned long)(RAMP_FIRST + k);
+  return NearestColor(ramp_rgb[k][0], ramp_rgb[k][1], ramp_rgb[k][2]);
+}
+
 void XcPaintGridLocked(const XcWindow *w, int cols, int rows,
                        const XcGridCell *grid, const uint32_t *list, int n) {
   if (!Viewable(w)) return;
@@ -394,10 +429,11 @@ void XcPaintGridLocked(const XcWindow *w, int cols, int rows,
       len += (size_t)sprintf(buf + len, "\033[%d;%dH", r + 1, c + 1);
       cur_fg = cur_bg = (unsigned long)-1;
     }
-    if (g->fg != cur_fg || g->bg != cur_bg) {
-      Sgr(buf, &len, g->fg & 15, g->bg & 15);
-      cur_fg = g->fg;
-      cur_bg = g->bg;
+    unsigned long fg = SaverColor(g->fg), bg = SaverColor(g->bg);
+    if (fg != cur_fg || bg != cur_bg) {
+      Sgr(buf, &len, fg, bg);
+      cur_fg = fg;
+      cur_bg = bg;
     }
     len += PutUtf8(buf + len, XcPrintableCell(g->cp) ? g->cp : ' ');
     at_c = c + 1;
@@ -821,6 +857,8 @@ static int SetMapped(Window w, int mapped, int raise) {
   int changed = win->mapped != mapped;
   win->mapped = mapped;
   if (raise) win->stack = xc.shm->next_stack++;
+  // The prompt shows: its colours are the console's, before it is painted.
+  if (changed && mapped && w == xc.shm->auth_window) XcSetRampLocked(0);
   if (changed || raise) RepaintWindowArea(win);
   if (changed && mapped && w == xc.shm->auth_window) {
     // The prompt shows: the saver window goes blank now, not when the saver

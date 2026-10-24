@@ -27,7 +27,8 @@ limitations under the License.
  * control sequences reach the console; its stdin is the pseudo-terminal,
  * where nothing is ever typed.
  *
- * XSECURELOCK_MATRIX_OPTIONS: cmatrix's options (default "-ab -u 5").
+ * XSECURELOCK_MATRIX_OPTIONS: cmatrix's options (default "-ab -u 5"); its
+ * colour options have no effect, the lock's green ramp colours the rain.
  */
 
 #include <errno.h>
@@ -89,30 +90,94 @@ static uint8_t ConsoleColor(const VTermColor *c, int fg) {
                    (c->rgb.blue > 85) << 2 | bright << 3);
 }
 
+/*! \brief What the lock shows of a cell. cmatrix's own colours are not
+ * used: the console's palette may not tell its greens apart (Nord: green and
+ * bright green are one colour). Each trail is coloured by the lock's green
+ * ramp instead: its newest cell (the head) brightest, the older cells above
+ * it darker and darker up to the oldest, at the trail's top. A cell that
+ * changes in place (cmatrix's glitter) keeps its age. */
+typedef struct {
+  uint32_t cp;
+  uint32_t birth;  // the frame its character appeared on a blank cell
+  uint8_t bg;
+  uint8_t lit;
+  uint8_t level;  // ramp level, 0 = head
+  uint8_t send;
+} Cell;
+
+static Cell *cells;
+static unsigned char *touched;  // per column
+static uint32_t frame;
+
+//! Ramp levels of a column: per trail (run of lit cells), the newest cell
+//! is the head (level 0); the others get 1 to the darkest by their distance
+//! from it, spread over the trail's length.
+static void Levels(int col) {
+  for (int r = 0; r < rows;) {
+    if (!cells[r * cols + col].lit) {
+      ++r;
+      continue;
+    }
+    int start = r;
+    while (r < rows && cells[r * cols + col].lit) ++r;
+    int len = r - start, head = start;
+    for (int i = start; i < r; ++i) {
+      if (cells[i * cols + col].birth >= cells[head * cols + col].birth) head = i;
+    }
+    for (int i = start; i < r; ++i) {
+      int d = i > head ? i - head : head - i;
+      int level = d == 0 ? 0
+                         : 1 + (d - 1) * (XC_SAVER_RAMP_LEVELS - 1) /
+                                   (len > 1 ? len - 1 : 1);
+      if (level >= XC_SAVER_RAMP_LEVELS) level = XC_SAVER_RAMP_LEVELS - 1;
+      Cell *c = &cells[i * cols + col];
+      if (c->level != level) {
+        c->level = (uint8_t)level;
+        c->send = 1;
+      }
+    }
+  }
+}
+
 static void SendCells(void) {
   static char buf[XC_SAVER_MAX_MSG];
+  ++frame;
+  memset(touched, 0, (size_t)cols);
+  for (int idx = 0; idx < cols * rows; ++idx) {
+    if (!dirty[idx]) continue;
+    dirty[idx] = 0;
+    VTermPos pos = {idx / cols, idx % cols};
+    VTermScreenCell vc;
+    uint32_t cp = ' ';
+    uint8_t bg = 0;
+    if (vterm_screen_get_cell(screen, pos, &vc)) {
+      if (vc.chars[0] != 0 && vc.width == 1) cp = vc.chars[0];
+      bg = ConsoleColor(vc.attrs.reverse ? &vc.fg : &vc.bg, vc.attrs.reverse);
+    }
+    Cell *c = &cells[idx];
+    uint8_t lit = cp != ' ';
+    if (lit && !c->lit) c->birth = frame;
+    c->cp = cp;
+    c->bg = bg;
+    c->lit = lit;
+    c->send = 1;
+    touched[pos.col] = 1;
+  }
+  for (int col = 0; col < cols; ++col) {
+    if (touched[col]) Levels(col);
+  }
   XcSaverCells h = {XC_SAVER_CELLS, 0};
   for (int idx = 0; idx <= cols * rows; ++idx) {
-    if (idx < cols * rows && dirty[idx]) {
-      dirty[idx] = 0;
-      VTermPos pos = {idx / cols, idx % cols};
-      VTermScreenCell vc;
+    if (idx < cols * rows && cells[idx].send) {
+      Cell *c = &cells[idx];
+      c->send = 0;
       XcSaverCell cell;
       memset(&cell, 0, sizeof(cell));
-      cell.col = (uint16_t)pos.col;
-      cell.row = (uint16_t)pos.row;
-      cell.cp = ' ';
-      cell.fg = 7;
-      if (vterm_screen_get_cell(screen, pos, &vc)) {
-        if (vc.chars[0] != 0 && vc.width == 1) cell.cp = vc.chars[0];
-        cell.fg = ConsoleColor(&vc.fg, 1);
-        cell.bg = ConsoleColor(&vc.bg, 0);
-        if (vc.attrs.reverse) {
-          uint8_t t = cell.fg;
-          cell.fg = cell.bg;
-          cell.bg = t;
-        }
-      }
+      cell.col = (uint16_t)(idx % cols);
+      cell.row = (uint16_t)(idx / cols);
+      cell.cp = c->cp;
+      cell.fg = c->lit ? (uint8_t)(XC_SAVER_RAMP + c->level) : 7;
+      cell.bg = c->bg;
       memcpy(buf + sizeof(h) + h.n * sizeof(cell), &cell, sizeof(cell));
       ++h.n;
     }
@@ -172,8 +237,12 @@ static void Resize(int c, int r) {
   if (r < 1) r = 1;
   fprintf(stderr, "saver_matrix: %d x %d cells\n", c, r);
   free(dirty);
+  free(cells);
+  free(touched);
   dirty = calloc((size_t)(c * r), 1);
-  if (dirty == NULL) Die("calloc");
+  cells = calloc((size_t)(c * r), sizeof(*cells));
+  touched = calloc((size_t)c, 1);
+  if (dirty == NULL || cells == NULL || touched == NULL) Die("calloc");
   cols = c;
   rows = r;
   vterm_set_size(vt, rows, cols);

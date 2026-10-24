@@ -141,12 +141,28 @@ the prompt is gone (after `XSECURELOCK_AUTH_TIMEOUT`).
 [cmatrix](https://github.com/abishekvashok/cmatrix) on a pseudo-terminal of
 its own (stdin, stdout, stderr; TERM=linux; size = the window's cells) and
 keeps that terminal's screen with libvterm (MIT); the changed cells go
-through the channel. cmatrix is GPL-3 and runs as a separate program found in
+through the channel, coloured by the lock's green ramp (below), not by
+cmatrix. cmatrix is GPL-3 and runs as a separate program found in
 `$PATH` (packaged as `cmatrix` on Arch, CachyOS and Arch LoongArch); nothing
-of it is copied or linked into this Apache-2.0 tree. Colours: cmatrix's
-ncurses colours as the console shows them, bold as bright (green 2 for the
-rain, bold bright green 10 with `-b`, white 15 for the falling heads with
-`-a`). It never sees the lock VT: its terminal is the pty, where nothing is
+of it is copied or linked into this Apache-2.0 tree.
+
+Colours: the console palette may not tell greens apart (the Nord palette of
+corentin, yoga3 and 3a5000 has green = bright green), so a saver may send
+six more colours, the **green ramp** (`XC_SAVER_RAMP` + 0-5): `#d0ffd0`
+(the head), `#30f030`, `#10c010`, `#089008`, `#046004`, `#023802`. While a
+saver shows, the lock sets them as palette entries 1-6 of the lock VT with
+the console's escape `ESC ] P n rrggbb`, which changes that VT's palette
+only (not the other consoles', as PIO_CMAP would); while the ramp is off a
+ramp colour is drawn as the nearest console colour. The entries go back to
+the console's palette (read with GIO_CMAP at lock start) when the auth
+window is mapped (by the process mapping it, before the prompt is painted),
+when the channel thread sees the prompt, and on unlock. A killed lock leaves
+the ramp only on its own VT, which stays in front (fail closed) and is not
+the session's. saver_matrix colours each trail (a vertical run of cmatrix's
+characters) by age: its newest cell (the head) gets level 0, the cells above
+it levels 1 to 5 by their distance from the head over the trail's length,
+so the oldest cells at the top are the darkest; a cell whose character
+changes in place keeps its age. It never sees the lock VT: its terminal is the pty, where nothing is
 typed. If the pty closes (saver_matrix killed), cmatrix gets SIGHUP; it also
 has SIGTERM as parent-death signal. When the window's size changes (a rotated
 console), saver_matrix starts a new cmatrix on a new pty of the new size:

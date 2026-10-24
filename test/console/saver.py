@@ -5,20 +5,25 @@ Run as root on a machine nobody is using at the console (it switches VTs):
     sudo python3 test/console/saver.py
 
 Locks VT 12 for a throwaway user whose ~/.config/ttysecurelock/environment
-sets XSECURELOCK_SAVER=saver_matrix and a short XSECURELOCK_AUTH_TIMEOUT (so
-it also tests that the settings file reaches the lock; the lock runs with an
-empty environment), and checks with /dev/vcsu and /dev/vcsa of the lock VT:
-  1. the rain shows: the screen changes over time, most text cells are green;
-  2. a key shows the auth prompt on top: the user name is on the screen and
-     no green cell is left while it shows;
-  3. after XSECURELOCK_AUTH_TIMEOUT the rain is back;
+sets XSECURELOCK_SAVER=saver_matrix and XSECURELOCK_AUTH_TIMEOUT=60 (so it
+also tests that the settings file reaches the lock; the lock runs with an
+empty environment), and checks with /dev/vcsu, /dev/vcsa and /dev/fb0:
+  1. the rain shows: the screen changes over time, its cells are in the
+     lock's green ramp (palette entries 1-6), each trail goes from its head
+     (brightest) up to darker and darker greens, and the framebuffer shows
+     the ramp's colours; a rotated console is filled again;
+  2. a key shows the auth prompt on top: the user name is on the screen, no
+     rain cell is left, and the framebuffer shows the prompt in the
+     console's own palette (the ramp undone);
+  3. after XSECURELOCK_AUTH_TIMEOUT (60 s) the rain is back;
   4. cmatrix and saver_matrix hold no fd of the lock VT, the window table,
      /dev/input or the console; the user cannot read /dev/input or the
      lock's memory; the lock VT stays in K_MEDIUMRAW with the lock's termios;
   5. CPU of cmatrix, saver_matrix and the lock over 20 s (reported);
   6. SIGKILL of cmatrix and saver_matrix by the user: still locked, the rain
      comes back (saver_multiplex restarts it), the prompt still works;
-  7. wrong password keeps it locked; the right one unlocks (exit 0).
+  7. wrong password keeps it locked; the right one unlocks (exit 0), and the
+     console palette (GIO_CMAP) is as before.
 Takes /tmp/vt12-test.lock and refuses to run while a real lock is active.
 """
 import collections
@@ -38,9 +43,15 @@ import security as s  # noqa: E402  (its keyboard, VT and process helpers)
 from parity import font_shift  # noqa: E402
 
 USER, PASSWORD = s.USER, s.PASSWORD
-AUTH_TIMEOUT = 6
+AUTH_TIMEOUT = 60  # the user's setting
 KDGKBMODE, K_MEDIUMRAW = 0x4B44, 2
-GREEN = (2, 10)
+GIO_CMAP, KDFONTOP = 0x4B70, 0x4B72
+# The lock's green ramp (xconsole/display.c): palette entries 1-6 of the lock
+# VT while the rain shows, brightest (a trail's head) first.
+RAMP = (1, 2, 3, 4, 5, 6)
+RAMP_RGB = ((0xd0, 0xff, 0xd0), (0x30, 0xf0, 0x30), (0x10, 0xc0, 0x10),
+            (0x08, 0x90, 0x08), (0x04, 0x60, 0x04), (0x02, 0x38, 0x02))
+VGA_TO_ANSI = (0, 4, 2, 6, 1, 5, 3, 7)
 
 failures = 0
 
@@ -52,10 +63,11 @@ def check(name, ok, detail=""):
     failures += not ok
 
 
-def screen(vt):
-    """(text cells, colours): the characters and foreground colours (VGA
-    order: green is 2 as in ANSI; with a 512-glyph font the kernel drops the
-    intensity bit, so bright green shows as 2 and white as 7)."""
+def screen(vt, with_bg=False):
+    """(text cells, colours, columns): the characters and the foreground
+    colours as ANSI/palette indices (vcsa holds VGA attributes; with a
+    512-glyph font the kernel drops the intensity bit, so 0-7 only). One
+    read of vcsa for the colours, so a trail is not torn between reads."""
     shift = font_shift(vt)
     raw = open(f"/dev/vcsa{vt}", "rb").read()
     rows, cols = raw[0], raw[1]
@@ -63,15 +75,120 @@ def screen(vt):
     chars = open(f"/dev/vcsu{vt}", "rb").read()
     text = [chr(c) for c in struct.unpack(f"{rows * cols}I",
                                           chars[:4 * rows * cols])]
-    fgs = [(cells[2 * i + 1] >> shift) & (0x07 if shift else 0x0f)
-           for i in range(rows * cols)]
+
+    def ansi(v):
+        v = (v >> shift) & (0x07 if shift else 0x0f)
+        return VGA_TO_ANSI[v & 7] + (v & 8)
+    fgs = [ansi(cells[2 * i + 1]) for i in range(rows * cols)]
+    if with_bg:
+        bgs = [VGA_TO_ANSI[(cells[2 * i + 1] >> (4 + shift)) & 7]
+               for i in range(rows * cols)]
+        lit = [cells[2 * i] != 32 for i in range(rows * cols)]
+        return text, fgs, cols, bgs, lit
     return text, fgs, cols
+
+
+def trails(vt):
+    """Per column, each run of lit cells top to bottom: its ramp levels must
+    not get darker towards the bottom (the head, level 0). Returns (runs,
+    monotonic runs, runs with a head)."""
+    _, fgs, cols, _, lit = screen(vt, with_bg=True)
+    rows = len(fgs) // cols
+    runs = mono = heads = 0
+    for c in range(cols):
+        r = 0
+        while r < rows:
+            if not lit[r * cols + c]:
+                r += 1
+                continue
+            start = r
+            while r < rows and lit[r * cols + c]:
+                r += 1
+            lv = [RAMP.index(fgs[i * cols + c]) if fgs[i * cols + c] in RAMP
+                  else 99 for i in range(start, r)]
+            runs += 1
+            mono += all(a >= b for a, b in zip(lv, lv[1:])) and 99 not in lv
+            heads += lv[-1] == 0
+    return runs, mono, heads
+
+
+def palette():
+    fd = os.open("/dev/tty0", os.O_RDONLY | os.O_NOCTTY)
+    buf = bytearray(48)
+    fcntl.ioctl(fd, GIO_CMAP, buf)
+    os.close(fd)
+    return [tuple(buf[3 * i:3 * i + 3]) for i in range(16)]
+
+
+def font_size(vt):
+    fd = os.open(f"/dev/tty{vt}", os.O_RDONLY | os.O_NOCTTY)
+    op = bytearray(struct.pack("IIIIIP", 1, 0, 64, 128, 512, 0))
+    try:
+        fcntl.ioctl(fd, KDFONTOP, op)
+    finally:
+        os.close(fd)
+    return struct.unpack("IIIIIP", op)[2:4]
+
+
+def cell_pixels(fb, idx, cols, cw, ch, stride):
+    """The colours a framebuffer snapshot (fbcon, rotation 0, 32 bits per
+    pixel) shows in a text cell."""
+    r, c = divmod(idx, cols)
+    out = set()
+    for y in range(r * ch, r * ch + ch):
+        o = y * stride + c * cw * 4
+        for x in range(cw):
+            b, g, rr = fb[o + 4 * x], fb[o + 4 * x + 1], fb[o + 4 * x + 2]
+            out.add((rr, g, b))
+    return out
+
+
+def colours_shown(vt, want, name, limit=40, cover=()):
+    """Check with the framebuffer that lit cells show only the colours of
+    `want(idx, fg, bg)` -> (allowed foreground rgbs, background rgb), and
+    one of those foregrounds; `cover`: colours that must all be seen. The
+    rain moves: the framebuffer is read between two reads of vcsa, and only
+    cells that did not change between those are used."""
+    if not os.path.exists("/dev/fb0"):
+        print("INFO  no /dev/fb0: colours on the screen not checked")
+        return
+    cw, ch = font_size(vt)
+    stride = int(open("/sys/class/graphics/fb0/stride").read())
+    bad, seen, shown = [], 0, set()
+    for _ in range(5):
+        a = screen(vt, with_bg=True)
+        with open("/dev/fb0", "rb") as f:
+            fb = f.read()
+        b = screen(vt, with_bg=True)
+        text, fgs, cols, bgs, _ = a
+        # Brightest first: the heads move every frame, few stay put.
+        for i in sorted(range(len(text)), key=lambda i: fgs[i]):
+            chr_ = text[i]
+            if chr_ in " \0" or (b[0][i], b[1][i], b[3][i]) != \
+                    (chr_, fgs[i], bgs[i]):
+                continue
+            exp = want(i, fgs[i], bgs[i])
+            if exp is None:
+                continue
+            got = cell_pixels(fb, i, cols, cw, ch, stride)
+            seen += 1
+            shown |= got
+            if not got <= set(exp[0]) | {exp[1]} or not got & set(exp[0]):
+                bad.append(f"{chr_!r} fg {fgs[i]}: {sorted(got)} want {exp}")
+            if seen >= limit:
+                break
+        if seen >= limit:
+            break
+    missing = [c for c in cover if c not in shown]
+    check(name, seen > 0 and not bad and not missing,
+          f"{seen} cells; " + "; ".join(bad[:3]) +
+          (f"; colours never seen: {missing}" if missing else ""))
 
 
 def rain_stats(vt):
     text, fgs, _ = screen(vt)
     lit = [i for i, c in enumerate(text) if c not in " \0"]
-    green = [i for i in lit if fgs[i] in GREEN]
+    green = [i for i in lit if fgs[i] in RAMP]
     rain_stats.colours = collections.Counter(fgs[i] for i in lit)
     return text, len(lit), len(green)
 
@@ -107,11 +224,12 @@ def rain_shows(vt, name):
     changed = sum(a != b for a, b in zip(t1, t2))
     check(f"{name}: the rain shows (text cells change)", changed > 20,
           f"{changed} cells changed in 1 s, {lit2} lit")
-    # cmatrix: green drops with bold (bright green) cells and a white head.
-    others = set(rain_stats.colours) - set(GREEN) - {7, 15}
-    check(f"{name}: ... in green", lit2 > 0 and green2 >= 0.5 * lit2 and
-          not others, f"{green2} of {lit2} lit cells green; colours "
-          f"{dict(rain_stats.colours)}")
+    check(f"{name}: ... in the green ramp", lit2 > 0 and green2 >= 0.98 * lit2,
+          f"{green2} of {lit2} lit cells; colours {dict(rain_stats.colours)}")
+    runs, mono, heads = trails(vt)
+    check(f"{name}: trails fade from the head up, monotonically",
+          runs > 10 and mono >= 0.95 * runs and heads >= 0.9 * runs,
+          f"{mono} of {runs} trails monotonic, {heads} with a head")
 
 
 def main():
@@ -124,6 +242,7 @@ def main():
     if shutil.which("cmatrix") is None:
         sys.exit("cmatrix is not installed")
     orig_vt = s.active_vt()
+    pal0 = palette()
     subprocess.run(["useradd", "-m", "-s", "/usr/bin/nologin", "-c",
                     "ttysecurelock saver test", USER], check=True)
     home = pwd.getpwnam(USER).pw_dir
@@ -147,6 +266,11 @@ def main():
 
         # 1. Rain.
         rain_shows(lock_vt, "idle")
+        colours_shown(
+            lock_vt, lambda i, fg, bg: ([RAMP_RGB[RAMP.index(fg)]], pal0[bg])
+            if fg in RAMP else None,
+            "rain: the screen shows the ramp's six greens (framebuffer)",
+            limit=100000, cover=RAMP_RGB)
 
         # 1b. A rotated console (fbcon rotation changes the VT's size): the
         # rain fills the new screen.
@@ -230,8 +354,15 @@ def main():
                   f"{green} green cells")
             time.sleep(1.0)
 
+        # With a 512-glyph font vcsa has no intensity bit: fg or fg + 8.
+        colours_shown(
+            lock_vt, lambda i, fg, bg: ([pal0[fg], pal0[(fg + 8) % 16]],
+                                        pal0[bg]),
+            "prompt: the console's own colours, the ramp undone "
+            "(framebuffer)")
+
         # 3. Back after the auth timeout.
-        time.sleep(AUTH_TIMEOUT + 2)
+        time.sleep(AUTH_TIMEOUT + 3 - 3.0)  # the prompt checks took 3 s
         check("after the auth timeout the prompt is gone",
               USER not in "".join(screen(lock_vt)[0]))
         rain_shows(lock_vt, "after the auth timeout")
@@ -264,6 +395,7 @@ def main():
             rc = None
         time.sleep(0.5)
         check("right password: the lock exits 0", rc == 0, f"exit {rc}")
+        check("... the console palette (GIO_CMAP) is as before", palette() == pal0)
         check("... back on the locked VT", s.active_vt() == s.VT,
               f"VT {s.active_vt()}")
         time.sleep(1.0)
