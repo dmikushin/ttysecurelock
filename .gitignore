@@ -1,3 +1,48 @@
-ttysecurelock
-authproto_pam
-__pycache__/
+# Dependency files.
+.deps
+.dirstamp
+
+# Autotools generated files.
+/Makefile
+/Makefile.in
+/aclocal.m4
+/autom4te.cache
+/compile
+/config.log
+/config.status
+/configure
+/depcomp
+/helpers/authproto_htpasswd
+/helpers/authproto_pamtester
+/helpers/saver_mplayer
+/helpers/saver_mpv
+/helpers/saver_xscreensaver
+/install-sh
+/missing
+/version.c
+
+# Our own generated files.
+/Doxyfile
+/env_helpstr.inc
+/xsecurelock.1
+/xsecurelock.1.md
+
+# Object files.
+*.o
+
+# Binaries.
+/auth_x11
+/authproto_pam
+/cat_authproto
+/dimmer
+/get_compositor
+/nvidia_break_compositor
+/pgrp_placeholder
+/remap_all
+/saver_multiplex
+/until_nonidle
+/xsecurelock
+
+# Doxygen stuff.
+/doxy
+/doxyfile.stamp
