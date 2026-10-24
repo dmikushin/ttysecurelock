@@ -304,6 +304,10 @@ static int ReadAltGrLock(void) {
       known = 1;
       result = b > 0;
     }
+    if (getenv("XSECURELOCK_DEBUG_CONSOLE_LAYOUT")) {
+      Log("layout probe %d: brightness %d, trigger %s", i, b,
+          strstr(current, "[kbd-altgrlock]") ? "ours" : "not ours");
+    }
   }
   if (!known) {
     Log("Could not read the console's layout through %s; assuming the first",

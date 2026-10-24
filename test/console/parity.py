@@ -434,6 +434,11 @@ def run_console(scenario, outdir, kb):
     fd = os.open(TTY, os.O_RDONLY | os.O_NOCTTY)
     fcntl.ioctl(fd, KDSKBLED, 0)
     os.close(fd)
+    # The kernel publishes the lock state of the console the last key went
+    # to (drivers/tty/vt/keyboard.c: `kbd` is set per key event): a key on
+    # VT 12 first, as the user's lock hotkey is pressed on his VT.
+    emit(kb, tap(SHIFT))
+    time.sleep(0.2)
     want = scenario.get("initial_group", 0)
     if altgr_lock() != want:
         emit(kb, tap(CAPS))
@@ -442,6 +447,7 @@ def run_console(scenario, outdir, kb):
     env = dict(BASE_ENV)
     env.update(scenario["env"])
     env["LD_PRELOAD"] = f"{outdir}/randshim.so"
+    env["XSECURELOCK_DEBUG_CONSOLE_LAYOUT"] = "1"
     log = os.path.join(outdir, f"console-{scenario['name']}.stderr")
     proc = subprocess.Popen(["env", "-i",
                              *[f"{k}={v}" for k, v in env.items()],
@@ -502,6 +508,18 @@ def at(frames, t):
     return f
 
 
+def reaction(frames, sent, end, prev):
+    """The frames once the step's keys were all sent, the one showing at
+    that moment first unless it is still the previous step's last frame
+    (whether a redraw lands just before or after that moment is timing)."""
+    out = [f for _, f in dedup([(sent, at(frames, sent))] +
+                               [(t, f) for t, f in frames
+                                if sent < t < end - 50])]
+    if out and out[0] == prev:
+        out = out[1:]
+    return out
+
+
 def compare(scenario, x, c):
     problems = []
     if "error" in c:
@@ -511,18 +529,18 @@ def compare(scenario, x, c):
     xs = [f for _, f in dedup(xn)]
     cs = [f for _, f in dedup(cn)]
     report = []
+    prev_x = prev_c = []
     for (name, _, xend, xsent), (_, _, cend, csent) in zip(x["steps"],
                                                          c["steps"]):
         # The frame at the end of the step, and the frames the program
         # showed in reaction once the step's keys were all in (frames while
         # keys are still arriving depend on timing, not on the program).
         xf, cf = at(xn, xend - 50), at(cn, cend - 50)
-        xr = [f for _, f in dedup([(xsent, at(xn, xsent))] +
-                                  [(t, f) for t, f in xn
-                                   if xsent < t < xend - 50])]
-        cr = [f for _, f in dedup([(csent, at(cn, csent))] +
-                                  [(t, f) for t, f in cn
-                                   if csent < t < cend - 50])]
+        # (Frames drawn while the keys were still being sent are left out:
+        # whether a redraw lands before or after that moment is timing.)
+        xr = reaction(xn, xsent, xend, prev_x)
+        cr = reaction(cn, csent, cend, prev_c)
+        prev_x, prev_c = xf, cf
         if scenario.get("blink"):
             xr, cr = sorted(set(map(str, xr))), sorted(set(map(str, cr)))
         ok = xf == cf and xr == cr
