@@ -59,6 +59,27 @@ if HAVE_XKB_EXT
 macros += -DHAVE_XKB_EXT
 endif
 
+# --enable-console: the xconsole platform layer replaces libX11.
+if CONSOLE
+# The installed program is ttysecurelock (xconsole/entry.c, which calls
+# xsecurelock's main renamed to xsecurelock_main); its helpers live apart
+# from an X xsecurelock's.
+pkglibexecdir = $(libexecdir)/ttysecurelock
+noinst_LIBRARIES = libxconsole.a
+libxconsole_a_SOURCES = \
+	xconsole/display.c \
+	xconsole/entry.c \
+	xconsole/keyboard.c \
+	xconsole/vt.c \
+	xconsole/xconsole_internal.h
+libxconsole_a_CPPFLAGS = -D_GNU_SOURCE
+xlibs = libxconsole.a -lpthread
+main_rename = -Dmain=xsecurelock_main
+else
+xlibs =
+main_rename =
+endif
+
 bin_PROGRAMS = \
 	xsecurelock
 xsecurelock_SOURCES = \
@@ -77,8 +98,8 @@ xsecurelock_SOURCES = \
 	incompatible_compositor.xbm
 nodist_xsecurelock_SOURCES = \
 	env_helpstr.inc
-xsecurelock_CPPFLAGS = $(macros) $(LIBBSD_CFLAGS)
-xsecurelock_LDADD = $(LIBBSD_LIBS)
+xsecurelock_CPPFLAGS = $(macros) $(LIBBSD_CFLAGS) $(main_rename)
+xsecurelock_LDADD = $(LIBBSD_LIBS) $(xlibs)
 
 helpersdir = $(pkglibexecdir)
 helpers_SCRIPTS = \
@@ -121,7 +142,9 @@ saver_multiplex_SOURCES = \
 	wm_properties.c wm_properties.h \
 	xscreensaver_api.c xscreensaver_api.h
 saver_multiplex_CPPFLAGS = $(macros)
+saver_multiplex_LDADD = $(xlibs)
 
+if !CONSOLE
 helpers_PROGRAMS += \
 	dimmer
 dimmer_SOURCES = \
@@ -130,6 +153,7 @@ dimmer_SOURCES = \
 	logging.c logging.h \
 	wm_properties.c wm_properties.h
 dimmer_CPPFLAGS = $(macros)
+endif
 
 if HAVE_IDLE_TIMER
 helpers_PROGRAMS += \
@@ -157,7 +181,7 @@ auth_x11_SOURCES = \
 	wm_properties.c wm_properties.h \
 	xscreensaver_api.c xscreensaver_api.h
 auth_x11_CPPFLAGS = $(macros) $(FONTCONFIG_CFLAGS) $(XFT_CFLAGS) $(LIBBSD_CFLAGS)
-auth_x11_LDADD = $(FONTCONFIG_LIBS) $(XFT_LIBS) $(LIBBSD_LIBS)
+auth_x11_LDADD = $(FONTCONFIG_LIBS) $(XFT_LIBS) $(LIBBSD_LIBS) $(xlibs)
 
 if HAVE_PAM
 helpers_PROGRAMS += \
@@ -194,7 +218,10 @@ CLEANFILES += xsecurelock.1.md xsecurelock.1
 endif
 
 # Some tools that we sure don't wan to install
-noinst_PROGRAMS = cat_authproto nvidia_break_compositor get_compositor remap_all
+noinst_PROGRAMS = cat_authproto
+if !CONSOLE
+noinst_PROGRAMS += nvidia_break_compositor get_compositor remap_all
+endif
 cat_authproto_SOURCES = \
 	logging.c logging.h \
 	helpers/authproto.c helpers/authproto.h \
@@ -209,6 +236,22 @@ remap_all_SOURCES= \
 	test/remap_all.c \
 	unmap_all.c unmap_all.h
 remap_all_CPPFLAGS = $(macros)
+
+if CONSOLE
+install-exec-hook:
+	mv -f $(DESTDIR)$(bindir)/xsecurelock $(DESTDIR)$(bindir)/ttysecurelock
+# The helpers run as the locked user. Unreadable binaries are not dumpable
+# after exec, so the user's other processes can neither ptrace them (auth_x11
+# exiting 0 unlocks) nor open their fds through /proc (the lock VT and the
+# shared window table). helpersdir is not an *exec*dir: automake installs the
+# helpers with the data.
+install-data-hook:
+	for f in $(helpers_PROGRAMS); do \
+		chmod 0711 $(DESTDIR)$(helpersdir)/$$f; \
+	done
+uninstall-hook:
+	rm -f $(DESTDIR)$(bindir)/ttysecurelock
+endif
 
 FORCE:
 version.c: FORCE

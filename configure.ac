@@ -17,6 +17,8 @@ define([nextversion],[1.9.0])
 AC_INIT([xsecurelock],[thisversion],[rpolzer@google.com])
 AM_INIT_AUTOMAKE([-Wall subdir-objects foreign])
 AC_PROG_CC
+AM_PROG_AR
+AC_PROG_RANLIB
 
 AC_DEFUN([RP_TRY_CC_FLAG], [
 	AC_MSG_CHECKING([whether the compiler supports $1])
@@ -41,13 +43,26 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([])],
                [AC_MSG_RESULT([no])
                 LDFLAGS=$saved_LDFLAGS])
 
+# ttysecurelock: build for the Linux text console instead of X. The X
+# headers are still used (types, constants, macros); the X library calls are
+# served by the xconsole platform layer (xconsole/), and no X extension
+# except XKB (which xconsole provides) is available.
+AC_ARG_ENABLE([console],
+              [AS_HELP_STRING([--enable-console],
+                              [Run on the Linux text console without X, using the xconsole platform layer instead of libX11 @<:@default=no@:>@])],
+              [enable_console=$enableval],
+              [enable_console=no])
+AM_CONDITIONAL([CONSOLE], [test x$enable_console = xyes])
+
 AC_CHECK_HEADER(X11/Xlib.h,
                 [], [AC_MSG_ERROR(X includes not found.)])
+AS_IF([test x$enable_console != xyes], [
 AC_CHECK_LIB(X11, XOpenDisplay,
              [], [AC_MSG_ERROR(X library not found.)])
 AC_CHECK_LIB(Xmuu, XmuClientWindow,
              [], [AC_CHECK_LIB(Xmu, XmuClientWindow,
              [], [AC_MSG_ERROR(Xmuu or Xmu library not found.)])])
+])
 AC_CHECK_LIB(m, sqrt,
              [], [AC_MSG_ERROR(Math library not found.)])
 
@@ -58,7 +73,13 @@ AC_DEFUN([RP_SEARCH_LIBS], [
                                       [$6 @<:@default=$5@:>@])],
                                       [with_$4=$withval],
                                       [with_$4=$5])
-          AS_IF([test "x$with_$4" = xno],
+          dnl --enable-console: xconsole provides XKB; the other X
+          dnl extensions do not exist on the console.
+          AS_IF([test "x$enable_console" = xyes && test "x$4" = xxkb],
+                [have_$4=true],
+                [test "x$enable_console" = xyes && test "x$4" != xpam],
+                [have_$4=false],
+                [test "x$with_$4" = xno],
                 [have_$4=false],
                 [AC_SEARCH_LIBS([$1], [$2],
                                 [have_$4=true],
@@ -74,7 +95,14 @@ AC_DEFUN([RP_SEARCH_PROG], [
                                       [$6 @<:@default=$5@:>@])],
                                       [with_$4=$withval],
                                       [with_$4=$5])
-          AS_IF([test "x$with_$4" = xno],
+          dnl --enable-console: savers that show X programs are not usable.
+          AS_IF([test "x$enable_console" = xyes && test "x$4" = xmplayer],
+                [have_$4=false],
+                [test "x$enable_console" = xyes && test "x$4" = xmpv],
+                [have_$4=false],
+                [test "x$enable_console" = xyes && test "x$4" = xxscreensaver],
+                [have_$4=false],
+                [test "x$with_$4" = xno],
                 [have_$4=false],
                 [path_to_$4=$with_$4
                  AC_PATH_PROG([path_to_$4], [$1], [], [$2])
@@ -92,7 +120,9 @@ AC_DEFUN([RP_CHECK_MODULE], [
                                       [$6 @<:@default=$5@:>@])],
                                       [with_$4=$withval],
                                       [with_$4=$5])
-          AS_IF([test "x$with_$4" = xno],
+          AS_IF([test "x$enable_console" = xyes && test "x$4" != xlibbsd],
+                [have_$4=false],
+                [test "x$with_$4" = xno],
                 [have_$4=false],
                 [PKG_CHECK_MODULES($1, [$2],
                                    [have_$4=true],
