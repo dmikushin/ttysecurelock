@@ -264,34 +264,50 @@ static int ReadAltGrLock(void) {
     close(fd);
     return 0;
   }
-  char path[128];
-  snprintf(path, sizeof(path), "/sys/class/leds/%s::capslock/trigger",
-           sysname);
-  int tfd = -1;
-  for (int i = 0; i < 100 && tfd < 0; ++i) {  // input-leds binds it async
-    tfd = open(path, O_WRONLY | O_CLOEXEC);
-    if (tfd < 0) usleep(10000);
-  }
-  if (tfd < 0) {
-    LogErrno("open %s (reading the console's layout)", path);
-  } else {
-    static const char trigger[] = "kbd-altgrlock";
-    if (write(tfd, trigger, sizeof(trigger) - 1) < 0) {
-      LogErrno("write %s", path);
-    } else {
-      snprintf(path, sizeof(path), "/sys/class/leds/%s::capslock/brightness",
-               sysname);
-      FILE *f = fopen(path, "r");
-      int b = 0;
-      if (f != NULL) {
-        if (fscanf(f, "%d", &b) != 1) b = 0;
-        fclose(f);
-      } else {
-        LogErrno("open %s", path);
-      }
+  // input-leds registers the LED asynchronously, and the LED class sets its
+  // default trigger (kbd-capslock) after the sysfs files appear: set ours,
+  // read the brightness, and accept it only if ours was the trigger all
+  // along.
+  char trigger_path[128], brightness_path[128];
+  snprintf(trigger_path, sizeof(trigger_path),
+           "/sys/class/leds/%s::capslock/trigger", sysname);
+  snprintf(brightness_path, sizeof(brightness_path),
+           "/sys/class/leds/%s::capslock/brightness", sysname);
+  static const char trigger[] = "kbd-altgrlock";
+  int known = 0;
+  for (int i = 0; i < 200 && !known; ++i) {
+    int tfd = open(trigger_path, O_WRONLY | O_CLOEXEC);
+    if (tfd < 0) {
+      usleep(5000);
+      continue;
+    }
+    ssize_t w = write(tfd, trigger, sizeof(trigger) - 1);
+    close(tfd);
+    if (w < 0) {
+      usleep(5000);
+      continue;
+    }
+    int b = 0;
+    FILE *f = fopen(brightness_path, "r");
+    if (f != NULL) {
+      if (fscanf(f, "%d", &b) != 1) b = -1;
+      fclose(f);
+    }
+    char current[1024] = "";
+    f = fopen(trigger_path, "r");
+    if (f != NULL) {
+      size_t n = fread(current, 1, sizeof(current) - 1, f);
+      current[n] = 0;
+      fclose(f);
+    }
+    if (b >= 0 && strstr(current, "[kbd-altgrlock]") != NULL) {
+      known = 1;
       result = b > 0;
     }
-    close(tfd);
+  }
+  if (!known) {
+    Log("Could not read the console's layout through %s; assuming the first",
+        trigger_path);
   }
   ioctl(fd, UI_DEV_DESTROY);
   close(fd);

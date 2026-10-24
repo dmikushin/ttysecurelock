@@ -119,7 +119,6 @@ void XcKeyboardInput(Display *dpy, const unsigned char *buf, size_t len);
 // vt.c
 int XcVtOpen(void);
 int XcVtBringToFront(void);
-int XcVtInFront(void);
 void XcVtRelease(int go_back);
 int XcVtDropPrivileges(void);
 

@@ -37,7 +37,7 @@ edit). Everything else happens behind the Xlib calls:
 | `XLookupString`, `XmbLookupString`, `XKeysymToString` | The characters the console itself would type: the keycode is translated with the kernel keymap (read with `KDGKBENT` through a VT in `K_UNICODE` mode), following the kernel's `kbd_keycode()`/`k_*` handlers (shift/AltGr/Ctrl/Alt maps, shift and AltGr locks, Caps Lock on letters, dead keys and the accent table, keypad with Num Lock). Keys X maps to fixed keysyms whatever the layout (Return, BackSpace, Tab, Escape, Delete, cursor, function, modifier and media keys) get those keysyms and texts. |
 | `XkbQueryExtension`, `XkbGetMap`, `XkbGetControls`, `XkbGetNames`, `XkbGetState`, `XkbGetIndicatorState`, `XkbLockGroup`, `XkbFreeKeyboard` | The XKB view of the console keyboard. Groups: 2 if the keymap has an AltGr lock (ruwin_cplk: CapsLock), named as X names the layouts from the letters the tables type ("English (US)", "Russian", ...). Group = the AltGr lock. Indicators: the 14 of an X server with the evdev rules, in its order ("Caps Lock", "Num Lock", "Scroll Lock", ..., "Shift Lock", "Group 2", "Mouse Keys"); lit from the console LED flags, the shift lock and the group. `XkbLockGroup` (auth_x11's Ctrl-Tab) sets the group. At lock time all of it is taken from the VT in front: its LED flags with `KDGKBLED`, its AltGr lock through the kernel's `kbd-altgrlock` LED trigger on a key-less uinput LED (there is no ioctl for a VT's lock state). |
 | `XAllocNamedColor`, `XQueryColor`, `XFreeColors`, `XCreateGC`, `XFreeGC` | Colours are the console's 16 (palette read with `GIO_CMAP`); a named colour (`#rrggbb`, `#rgb`, X names, `/usr/share/X11/rgb.txt`) gets the nearest one. |
-| `XLoadQueryFont`, `XTextWidth`, `XDrawString` | The console font as a core font one cell wide; its height is a cell minus auth_x11's line spacing, so its lines are one row apart. Text is UTF-8, written to the cells under it where no window above covers them. |
+| `XLoadQueryFont`, `XTextWidth`, `XDrawString` | The console font as a core font one cell wide; its height is a cell minus auth_x11's line spacing, so its lines are one row apart. Text is UTF-8, written to the cells under it where no window above covers them; a character takes the cells the console gives it (2 for double-width ones, 0 for combining marks). |
 | `XInternAtom`, `XGetAtomName`, `XChangeProperty`, `XSetWMProperties`, `XStringListToTextProperty`, `XAllocClassHint`, `XGetClassHint`, `XmuClientWindow`, `XFree` | Atoms in the shared table; window manager properties are accepted and ignored (there is no window manager). |
 | `XForceScreenSaver` | Blanks/unblanks the console (`TIOCL_BLANKSCREEN`). |
 | `XBell`, `XGetKeyboardControl`, `XChangeKeyboardControl` | `KDMKTONE` with the bell pitch and duration (XSECURELOCK_AUTH_SOUNDS). |
@@ -94,3 +94,26 @@ lost; the `disco` prompt computes its length as `stride * DANCERS *
 strlen(dancer) + strlen(combiner)` (auth_x11.c) — 1505 bytes for a 258-byte
 buffer — and so writes a NUL past the buffer and draws stack garbage after the
 dancers, under X as well.
+
+## Implementation limits (not forced by X, kept small on purpose)
+
+- At most 64 windows and 128 atoms in the shared table, 256 queued events in
+  the main program (xsecurelock uses a handful of each). Overflows are logged
+  (windows) or dropped (events, atoms).
+- Two XKB groups at most: the base table and the AltGr-lock table, the model
+  of keymaps like ruwin_cplk. Keymaps that switch layouts with other kernel
+  locks (ShiftL_Lock, CtrlL_Lock, ...) show one layout.
+- Without XRandR, upstream's own fallback (`helpers/monitors.c`,
+  GetMonitorsGuess) splits a screen wider than about 2.7:1 into several
+  "monitors", as it does under X without RandR.
+- `--user NAME` is required: the program starts as root (to take a VT), so it
+  must be told whom it locks for, and it refuses if the VT in front belongs to
+  someone else. The lock VT is taken from 63 down to 13 only: VTs below are
+  logind's autovt range, where switching starts a getty that hangs the lock VT
+  up.
+- A helper's children do not inherit the display (close-on-exec): a custom
+  `XSECURELOCK_SAVER` cannot draw. On the console no saver other than
+  `saver_blank` exists, and this keeps the lock VT and the window table away
+  from dumpable processes such as `sleep`.
+- `dimmer` and `until_nonidle` (pre-lock dimming and idle detection, both on
+  X extensions) are not built.

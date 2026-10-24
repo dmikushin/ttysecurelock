@@ -35,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 XSECURELOCK = "/usr/bin/xsecurelock"
@@ -135,10 +136,17 @@ def scenarios():
     wrong = text("wrong") + tap(ENTER)
     out.append({"name": "pam-failures",
                 "env": {"XSECURELOCK_PASSWORD_PROMPT": "asterisks"},
-                "steps": [("wrong 1", wrong, 6.0), ("wrong 2", wrong, 6.0),
-                          ("wrong 3", wrong, 6.0),
+                # After a failure the prompt closes; the next key wakes it
+                # and is not typed.
+                "steps": [("wake", tap(SHIFT), 2.0), ("wrong 1", wrong, 6.0),
+                          ("wake", tap(SHIFT), 2.0), ("wrong 2", wrong, 6.0),
+                          ("wake", tap(SHIFT), 2.0), ("wrong 3", wrong, 6.0),
+                          ("wake", tap(SHIFT), 2.0),
                           ("right while faillocked", password_keys(), 6.0),
                           ("faillock reset", [], 1.0, "reset"),
+                          # A new PAM transaction: Escape closes the prompt.
+                          ("escape", tap(ESC), 4.0),
+                          ("wake", tap(SHIFT), 2.0),
                           ("right", password_keys(), 4.0)]})
     out.append({"name": "blink", "env": {"XSECURELOCK_AUTH_CURSOR_BLINK": "1"},
                 "steps": [("a", tap(KEY["a"])), ("wait", [], 3.0),
@@ -154,9 +162,14 @@ def faillock_reset():
 # --- Frames -----------------------------------------------------------------
 
 def normalize(frame, scenario):
-    """Values that legitimately differ between two runs: time stamps."""
+    """Values that legitimately differ between two runs (time stamps), and
+    what /dev/vcsu cannot show: combining marks (the console draws them into
+    the cell before, vcsu keeps the base character) and the zero-width cell
+    the console pads a double-width character with."""
     out = []
     for t, w in frame:
+        t = "".join(ch for ch in t if ch != "\u200b" and
+                    unicodedata.category(ch) != "Mn")
         if scenario["name"] in ("datetime", "prompt-time", "prompt-time_hex"):
             t = re.sub(r"0x[0-9a-f]+", "0xH", t)
             t = re.sub(r"\d", "D", t)
@@ -387,7 +400,9 @@ class Poller(threading.Thread):
             try:
                 f = screen(self.vt, shift)
             except OSError:
-                break           # the lock VT is gone
+                # The lock VT is gone: unlocked, its screen was cleared.
+                self.frames.append((int(time.time() * 1000), []))
+                break
             t = int(time.time() * 1000)
             if f != last:
                 last, stable_since = f, t

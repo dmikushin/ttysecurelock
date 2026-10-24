@@ -40,6 +40,8 @@ limitations under the License.
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <locale.h>
+#include <wchar.h>
 
 #include "../logging.h"
 #include "xconsole_internal.h"
@@ -1035,12 +1037,28 @@ static int Utf8Next(const char *s, int len, unsigned int *cp) {
   return n;
 }
 
+/*! \brief Cells a character takes: 0 for a combining mark (the console
+ * draws it into the previous cell), 2 for a double-width one (the console
+ * pads it with a zero-width cell), else 1. */
+static int CellWidth(unsigned int cp) {
+  if (Combining(cp)) return 0;
+  if (cp < 0x1100) return 1;
+  // The console's widths are Unicode's whatever the program's locale is.
+  static locale_t utf8 = (locale_t)0;
+  if (utf8 == (locale_t)0) utf8 = newlocale(LC_CTYPE_MASK, "C.UTF-8", 0);
+  if (utf8 == (locale_t)0) return 1;
+  locale_t old = uselocale(utf8);
+  int w = wcwidth((wchar_t)cp);
+  uselocale(old);
+  return w == 2 ? 2 : 1;
+}
+
 static int TextCells(const char *s, int len) {
   int cells = 0;
   for (int i = 0; i < len;) {
     unsigned int cp;
     i += Utf8Next(s + i, len - i, &cp);
-    if (!Combining(cp)) ++cells;
+    cells += CellWidth(cp);
   }
   return cells;
 }
@@ -1078,26 +1096,38 @@ int XDrawString(Display *dpy, Drawable d, GC gc, int x, int y,
     return 0;
   }
   size_t len = 0;
-  int at = -1;
-  int c = col - 1;
+  int at = -1;   // the cell the console cursor is at after our last output
+  int c = col;   // the next character's cell
+  int prev = -1; // the previous character's cell, if it was drawn
   for (int k = 0; k < length;) {
     unsigned int cp;
     int n = Utf8Next(string + k, length - k, &cp);
-    int combining = Combining(cp);
-    if (!combining) ++c;
-    int visible = c >= paint[i].c0 && c < paint[i].c1 && row >= paint[i].r0 &&
-                  row < paint[i].r1 && !Covered(i, c, row);
-    if (visible && (!combining || at == c + 1)) {
-      if (at != c && !combining) {
+    int w = CellWidth(cp);
+    int visible = 1;
+    for (int x = c; x < c + (w ? w : 1); ++x) {
+      visible = visible && x >= paint[i].c0 && x < paint[i].c1 &&
+                row >= paint[i].r0 && row < paint[i].r1 && !Covered(i, x, row);
+    }
+    if (w == 0) {
+      // A combining mark goes with the character before it, if drawn.
+      if (prev >= 0 && at == c) {
+        memcpy(buf + len, string + k, (size_t)n);
+        len += (size_t)n;
+      }
+    } else if (visible) {
+      if (at != c) {
         len += (size_t)sprintf(buf + len, "\033[%d;%dH", row + 1, c + 1);
         Sgr(buf, &len, gc->foreground, bg);
       }
       memcpy(buf + len, string + k, (size_t)n);
       len += (size_t)n;
-      if (!combining) at = c + 1;
-    } else if (!combining) {
+      at = c + w;
+      prev = c;
+    } else {
+      prev = -1;
       at = -1;
     }
+    c += w;
     k += n;
   }
   Out(buf, len);

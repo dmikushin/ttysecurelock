@@ -76,8 +76,6 @@ static int ActiveVT(void) {
   return ioctl(xc.tty0, VT_GETSTATE, &st) == 0 ? st.v_active : -1;
 }
 
-int XcVtInFront(void) { return ActiveVT() == xc.vt; }
-
 /*! \brief A free VT for the lock, from the top (63) down to 13.
  *
  * Not VT_OPENQRY's first free VT: that is usually within logind's autovt
