@@ -69,6 +69,8 @@ libxconsole_a_SOURCES = \
 	xconsole/display.c \
 	xconsole/entry.c \
 	xconsole/keyboard.c \
+	xconsole/saver.c \
+	xconsole/saver_proto.h \
 	xconsole/vt.c \
 	xconsole/xcolors.inc \
 	xconsole/xconsole_internal.h \
@@ -144,6 +146,17 @@ saver_multiplex_SOURCES = \
 	xscreensaver_api.c xscreensaver_api.h
 saver_multiplex_CPPFLAGS = $(macros)
 saver_multiplex_LDADD = $(xlibs)
+
+# --enable-console: the console's saver modules (xconsole/saver_proto.h).
+if CONSOLE
+helpers_PROGRAMS += \
+	saver_matrix
+saver_matrix_SOURCES = \
+	xconsole/saver_matrix.c \
+	xconsole/saver_proto.h
+saver_matrix_CPPFLAGS = -D_GNU_SOURCE $(VTERM_CFLAGS)
+saver_matrix_LDADD = $(VTERM_LIBS)
+endif
 
 if !CONSOLE
 helpers_PROGRAMS += \

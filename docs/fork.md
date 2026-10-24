@@ -19,7 +19,32 @@ Run (as root; normally the hotkey daemon tty-i3-keys does it on Win+Escape):
 `ttysecurelock --user NAME [xsecurelock arguments]`. NAME must own the VT in
 front; the lock refuses otherwise. The settings are xsecurelock's
 `XSECURELOCK_*` environment variables, read by xsecurelock's own code with
-its defaults; see "Configuration" below for what each one does here.
+its defaults; see "Configuration" below for what each one does here, and
+"Settings file" for how they reach a lock started by a daemon.
+
+## Settings file
+
+tty-i3-keys starts the lock from a system service, whose environment is not
+the user's. So `ttysecurelock --user NAME` (`xconsole/entry.c`) also reads
+`~NAME/.config/ttysecurelock/environment`: lines `XSECURELOCK_NAME=value` in
+the syntax of environment.d(5) (`#` comments, blank lines, a value may be in
+single or double quotes; no `$` expansion). Only `XSECURELOCK_*` names are
+taken (others are logged and ignored), except those that decide who checks
+the password or what runs with the lock VT: `XSECURELOCK_AUTH`, `_AUTHPROTO`,
+`_PAM_SERVICE`, `_GLOBAL_SAVER`, `_SWITCH_USER_COMMAND`, `_KEY_*_COMMAND`
+and `_DEBUG_*` are ignored in the file (every
+process of the user can write it, and on the console such a process cannot
+otherwise undo a lock: killing it fails closed); they still work from the
+environment of whoever starts the lock. A variable already in the
+environment wins. The file is read by a child process that has dropped to NAME's uid,
+gids and groups before opening it, so root never opens a user's file; the
+parent only parses the bytes (at most 64 KiB). A file of its own, not
+`~/.config/environment.d`: those variables also reach the user's X session,
+where an X xsecurelock would look for the console's savers (corentin has
+xsecurelock installed). Example:
+
+    XSECURELOCK_SAVER=saver_matrix
+
 
 ## Configuration
 
@@ -41,9 +66,12 @@ Honoured, reduced by the console: `_BACKGROUND_COLOR`,
 (parsed as XAllocNamedColor does, then the nearest of the console's 16
 colours; see "Colours"), `_AUTH_SOUNDS` (the PC speaker tone),
 `_BURNIN_MITIGATION` and `_BURNIN_MITIGATION_DYNAMIC` (offsets in pixels move
-the prompt by whole cells), `_SAVER` (`saver_blank` works; a saver that draws
-cannot: there is no X for it), `_DEBUG_WINDOW_INFO` (calls xwininfo/xprop,
-which find no X).
+the prompt by whole cells), `_SAVER` (`saver_blank`, and the console's own
+`saver_matrix`; X savers cannot run, see "Savers"), `_DEBUG_WINDOW_INFO`
+(calls xwininfo/xprop, which find no X).
+
+Added by the console: `XSECURELOCK_MATRIX_OPTIONS`, cmatrix's options for
+`saver_matrix` (default `-ab -u 5`).
 
 No effect, their X feature does not exist on the console (compiled out):
 `_BLANK_DPMS_STATE` (no DPMS), `_COMPOSITE_OBSCURER`, `_NO_COMPOSITE`
@@ -62,10 +90,12 @@ edit). Everything else happens behind the Xlib calls:
 
 | Function | On the console |
 |---|---|
-| `XOpenDisplay` | In the main program (no `$DISPLAY` of ours): checks it runs as root and that NAME owns the VT in front, takes a free VT from the top (63 down to 13; `VT_OPENQRY` would land in logind's autovt range and get a getty), puts it in `VT_PROCESS` mode (every release request is refused), raw termios, reads the console keymap and the keyboard state of the VT in front (below), creates the shared window table (memfd), sets `$DISPLAY=:xconsole:<vt fd>:<memfd>` for the helpers, then drops to NAME's uid keeping only `CAP_SYS_TTY_CONFIG`, non-dumpable. In a helper: maps the table from the fds in `$DISPLAY` and marks those fds close-on-exec, so the helper's own children (authproto_pam, the saver's `sleep`) do not get them. |
+| `XOpenDisplay` | In the main program (no `$DISPLAY` of ours): checks it runs as root and that NAME owns the VT in front, takes a free VT from the top (63 down to 13; `VT_OPENQRY` would land in logind's autovt range and get a getty), puts it in `VT_PROCESS` mode (every release request is refused), raw termios, reads the console keymap and the keyboard state of the VT in front (below), creates the shared window table (memfd), sets `$DISPLAY=:xconsole:<vt fd>:<memfd>:<saver channel fd>` for the helpers, then drops to NAME's uid keeping only `CAP_SYS_TTY_CONFIG`, non-dumpable, and starts the saver channel's thread (see "Savers"). In a helper: maps the table from the fds in `$DISPLAY` and marks the VT and table fds close-on-exec, so the helper's own children (authproto_pam, the saver modules) do not get them; they keep only the saver channel. |
 | `XCloseDisplay` | Main program, reached only after a successful authentication: keyboard mode back, `VT_UNLOCKSWITCH`, `VT_AUTO`, back to the original VT, hands the console mouse selection to it (the kernel will not free a VT that owns it), `VT_DISALLOCATE` the lock VT. If the program dies instead, nothing of this happens: switching stays disabled (fail closed). |
 | `XGrabKeyboard` | Brings the lock VT to the front (repeated until it really is), keyboard in `K_MEDIUMRAW`, `VT_LOCKSWITCH`. |
 | `XGrabPointer`, `XGrabServer`, `XUngrabServer`, `XSetInputFocus`, `XGetInputFocus`, cursors, pixmaps, `XUndefineCursor` | No pointer, no other clients: succeed, do nothing. `XQueryPointer` reports the top left corner. |
+| `XMoveResizeWindow` of a window with children | A child that covered it exactly (at 0,0, same size) is resized with it. This stands in for XRandR: under X a screen change makes saver_multiplex recreate its per-monitor window (and saver) at the new size; here the screen is one monitor and its window follows the saver window, which main.c resizes with the screen (a rotated console). |
+| `XSetWMProperties` | Ignored, except that the main program notes its windows named "saver" and "auth" (wm_properties.c names them) for the saver channel. |
 | `XCreateWindow`, `XDestroyWindow`, `XMapWindow`, `XMapRaised`, `XUnmapWindow`, `XRaiseWindow`, `XRestackWindows`, `XConfigureWindow`, `XMoveResizeWindow`, `XChangeWindowAttributes`, `XGetWindowAttributes`, `XQueryTree`, `XClearWindow` | A window table shared by all processes of the lock; windows stack and clip as in X and are painted as console cells. Coordinates are pixels of a screen of console-font cells, so xsecurelock's pixel arithmetic keeps its meaning. Windows of processes that are gone are destroyed, as X destroys a disconnected client's windows. |
 | `XSelectInput`, `XPending`, `XNextEvent`, `XFilterEvent`, `XFlush` | Events of the main program: key events read from the lock VT (all that is there, into a queue that grows: nothing is dropped), X's autorepeat, Map/Unmap/Visibility/ConfigureNotify of its own windows, root ConfigureNotify when the console is resized. See "Events". |
 | `XLookupString`, `XmbLookupString`, `XKeysymToString` | See "Keys". |
@@ -77,9 +107,58 @@ edit). Everything else happens behind the Xlib calls:
 | `XBell`, `XGetKeyboardControl`, `XChangeKeyboardControl` | `KDMKTONE` with the bell pitch and duration (XSECURELOCK_AUTH_SOUNDS). |
 | `XSetErrorHandler`, `XGetErrorText`, `XOpenIM`, `XCreateIC` | Trivial. |
 
+## Savers
+
+A saver module never gets the lock VT or the window table (its parent,
+saver_multiplex, closes them on exec). It draws through the **saver
+channel** (`xconsole/saver_proto.h`, `xconsole/saver.c`): a datagram socket
+whose other end belongs to a thread of the main program. The saver connects
+by sending its window id ($XSCREENSAVER_WINDOW) with one end of a new
+SOCK_SEQPACKET pair attached; the kernel attaches its pid and uid
+(SO_PASSCRED). The lock accepts it if the uid is the lock's, the window lies
+inside xsecurelock's "saver" window and was created by the saver's parent
+(saver_multiplex, or xsecurelock for an `XSECURELOCK_GLOBAL_SAVER`); at most
+8 savers. It answers with the window's size in cells, and again whenever
+that changes. The saver sends cells: (column, row, code point, foreground,
+background), at most 5460 per message. The lock keeps them in a grid per
+saver and writes them itself, only printable one-cell characters (anything
+else becomes a space) in the 16 console colours, only where the window is
+visible (the auth window and everything above clip them, as under X); it
+repaints the grid when the screen under the window was repainted (a window
+unmapped or moved). The saver cannot read the keyboard, change the VT's
+modes, termios or font, or write control sequences (cursor reports, palette,
+LEDs) to the console, and it cannot draw outside the saver window. Killing
+it ends its connection and nothing else: upstream's saver_multiplex starts
+it again.
+
+The console's rule, not X's: while the auth window is mapped, every saver
+window is blank (the process that maps it repaints the saver window at once,
+and the channel paints nothing while it is mapped) (under X the saver goes on around the prompt box). The saver
+keeps running behind it; the lock keeps its cells and shows them again when
+the prompt is gone (after `XSECURELOCK_AUTH_TIMEOUT`).
+
+`saver_matrix` (`xconsole/saver_matrix.c`) is the "Matrix" rain: it runs
+[cmatrix](https://github.com/abishekvashok/cmatrix) on a pseudo-terminal of
+its own (stdin, stdout, stderr; TERM=linux; size = the window's cells) and
+keeps that terminal's screen with libvterm (MIT); the changed cells go
+through the channel. cmatrix is GPL-3 and runs as a separate program found in
+`$PATH` (packaged as `cmatrix` on Arch, CachyOS and Arch LoongArch); nothing
+of it is copied or linked into this Apache-2.0 tree. Colours: cmatrix's
+ncurses colours as the console shows them, bold as bright (green 2 for the
+rain, bold bright green 10 with `-b`, white 15 for the falling heads with
+`-a`). It never sees the lock VT: its terminal is the pty, where nothing is
+typed. If the pty closes (saver_matrix killed), cmatrix gets SIGHUP; it also
+has SIGTERM as parent-death signal. When the window's size changes (a rotated
+console), saver_matrix starts a new cmatrix on a new pty of the new size:
+cmatrix 2.0 as packaged resizes its screen on SIGWINCH but its rain stays in
+the old number of rows. Measured on 3a5000 (Loongson 3A5000,
+lock VT 53, `-ab -u 5`), 20 s: cmatrix 2.1%, saver_matrix 0.8%, the lock
+0.8% of one core (`test/console/saver.py`).
+
 ## Build glue
 
-`configure.ac`: `--enable-console`; with it libX11/Xmu are not required, XKB
+`configure.ac`: `--enable-console`; with it libX11/Xmu are not required, libvterm
+is (for `saver_matrix`), XKB
 is "available" (xconsole provides it), every other X extension (XComposite,
 XRandR, XScreenSaver, XSync, XF86Misc, DPMS, Xft, fontconfig) and the savers
 that need X (mplayer, mpv, xscreensaver) are off. `Makefile.am`: builds `libxconsole.a` and links the programs against it,
@@ -105,7 +184,7 @@ warnings.
   detection (`until_nonidle`, `XSECURELOCK_IDLE_TIMERS`), DPMS
   (`XSECURELOCK_BLANK_DPMS_STATE`: the console only blanks), dimmer
   (`XSECURELOCK_DIM_*`), and the X savers (mpv, mplayer, xscreensaver) do not
-  exist. `saver_blank` and `saver_multiplex` work.
+  exist. `saver_blank`, `saver_multiplex` and `saver_matrix` work.
 - **Fonts.** No Xft/fontconfig: `XSECURELOCK_FONT` is ignored and the
   console font is used. Characters take the cells the console gives them: 2
   for double-width ones (emoji), 0 for combining marks (drawn into the cell
@@ -183,7 +262,9 @@ uninitialised values.
 ## Events
 
 Map/Unmap/ConfigureNotify of the main program's windows are queued when the
-change is made (an X server sends them after processing the request; the
+change is made, with both `event` and `window` set to the window (main.c
+reads `xmap.window` and `xconfigure.window`: the auth window's mapped state,
+and the root's resize, after which it resizes its windows) (an X server sends them after processing the request; the
 program reads them later either way). VisibilityNotify is always Unobscured
 and there are no FocusIn/FocusOut events: on the lock VT nothing else can map
 a window or take the keyboard. Consequences for main.c: its "someone
@@ -207,9 +288,12 @@ there is no focus to restore after unlocking.
   someone else. The lock VT is taken from 63 down to 13 only: VTs below are
   logind's autovt range, where switching starts a getty that hangs the lock VT
   up.
-- A helper's children do not inherit the display (close-on-exec): a custom
-  `XSECURELOCK_SAVER` cannot draw. On the console no saver other than
-  `saver_blank` exists, and this keeps the lock VT and the window table away
-  from dumpable processes such as `sleep`.
+- A helper's children do not inherit the lock VT or the window table
+  (close-on-exec), which keeps them away from dumpable processes such as
+  `sleep` and the saver modules; a saver module draws only through the saver
+  channel ("Savers"), so an X saver (mpv, xscreensaver hacks) cannot run.
+  The channel fd itself is inherited by every helper's children, and a
+  saver module is dumpable: the user's own processes can draw into the saver
+  window through it (not elsewhere, and never while the prompt shows).
 - `dimmer` and `until_nonidle` (pre-lock dimming and idle detection, both on
   X extensions) are not built.

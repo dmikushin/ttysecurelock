@@ -51,3 +51,5 @@
 /ar-lib
 /configure~
 /libxconsole.a
+/saver_matrix
+__pycache__/

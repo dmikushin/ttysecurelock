@@ -80,6 +80,15 @@ typedef struct {
   unsigned int locks;    // the console's lock state (1 << KG_SHIFT, ...)
   unsigned int latches;  // the console's sticky (latched) shifts
   char group_names[2][XC_ATOM_NAME];
+
+  // Bumped whenever cells are repainted with window backgrounds (a window
+  // mapped, unmapped, moved, raised or destroyed): what a saver had there
+  // is gone, and the lock repaints it (saver.c).
+  uint64_t damage;
+  // xsecurelock's "saver" and "auth" windows, for any process that maps the
+  // auth window to blank the saver window at once (display.c). The saver
+  // channel's checks use the main program's own copies, not these.
+  Window saver_window, auth_window;
 } XcShared;
 
 //! Per-process connection.
@@ -96,6 +105,9 @@ typedef struct {
   // lock can write that, and so can whoever can open the fds of a helper
   // (a saver like `sleep` is dumpable); the VT handling must not trust it.
   int vt;
+  // The saver channel (saver.c): in the main program, its own end (saver
+  // modules connect there); in helpers, the end they pass on to savers.
+  int saver_fd;
 } XcConn;
 
 extern XcConn xc;
@@ -116,6 +128,30 @@ XcWindow *XcFindWindow(Window w);
 void XcQueueEvent(const XEvent *ev);
 void XcQueueKeyEvent(const XEvent *ev, const XcKeyText *key);
 Atom XcInternAtom(const char *name);
+//! The main program's saver window (the one xsecurelock names "saver").
+extern Window xc_saver_window;
+//! The main program's auth window (the prompt; xsecurelock's "auth").
+extern Window xc_auth_window;
+//! A saver's cell, as the lock keeps it (saver.c).
+typedef struct {
+  uint32_t cp;
+  uint8_t fg, bg;
+} XcGridCell;
+int XcViewable(const XcWindow *w);
+unsigned long XcWindowBackground(const XcWindow *w);
+//! A window's cell rectangle on the screen, clipped to it; 0 if empty.
+int XcWindowCellsLocked(const XcWindow *w, int *c0, int *r0, int *c1,
+                        int *r1);
+//! Paint cells of a saver grid (cols x rows, at the window's top left
+//! cell) where the window is visible: the listed ones, or all if n < 0.
+void XcPaintGridLocked(const XcWindow *w, int cols, int rows,
+                       const XcGridCell *grid, const uint32_t *list, int n);
+//! Whether a code point may be put in a cell as is (one cell, printable).
+int XcPrintableCell(uint32_t cp);
+
+// saver.c: saver modules draw into their saver window through the lock.
+int XcSaverServerStart(void);  // main program, after dropping privileges
+void XcSaverServerStop(void);
 
 // keyboard.c
 int XcKeyboardInit(int vt_fd, int orig_fd);

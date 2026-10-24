@@ -58,6 +58,9 @@ AS_IF([test x$enable_console = xyes],
       [helpersdir='${libexecdir}/ttysecurelock'],
       [helpersdir='${pkglibexecdir}'])
 AC_SUBST([helpersdir])
+dnl --enable-console: saver_matrix keeps cmatrix's screen with libvterm.
+AS_IF([test x$enable_console = xyes],
+      [PKG_CHECK_MODULES([VTERM], [vterm])])
 
 AC_CHECK_HEADER(X11/Xlib.h,
                 [], [AC_MSG_ERROR(X includes not found.)])

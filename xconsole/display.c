@@ -40,6 +40,7 @@ limitations under the License.
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <locale.h>
 #include <wchar.h>
@@ -49,7 +50,10 @@ limitations under the License.
 
 #define DISPLAY_PREFIX ":xconsole:"
 
-XcConn xc = {0, -1, -1, NULL, -1, 0, -1, -1};
+XcConn xc = {0, -1, -1, NULL, -1, 0, -1, -1, -1};
+
+Window xc_saver_window = None;
+Window xc_auth_window = None;
 
 // The Display: Xlib's public macros (DefaultScreen, ConnectionNumber, ...)
 // read the fields of _XPrivDisplay, so that is what it is.
@@ -136,7 +140,10 @@ static void QueueWindowEvent(int type, Window w) {
   ev.xany.window = w;
   if (type == MapNotify || type == UnmapNotify) {
     if (!(SelectedMask(w) & StructureNotifyMask)) return;
+    // xany.window is the event window in these events; the window that was
+    // (un)mapped or configured is a field of its own, which main.c reads.
     ev.xmap.event = w;
+    ev.xmap.window = w;  // XUnmapEvent has it at the same place
   } else if (type == VisibilityNotify) {
     if (!(SelectedMask(w) & VisibilityChangeMask)) return;
     ev.xvisibility.state = VisibilityUnobscured;
@@ -145,6 +152,7 @@ static void QueueWindowEvent(int type, Window w) {
     XcWindow *win = XcFindWindow(w);
     if (win == NULL) return;
     ev.xconfigure.event = w;
+    ev.xconfigure.window = w;
     ev.xconfigure.x = win->x;
     ev.xconfigure.y = win->y;
     ev.xconfigure.width = win->w;
@@ -162,6 +170,7 @@ typedef struct {
 } PaintEntry;
 
 static PaintEntry paint[XC_MAX_WINDOWS];
+static int CellWidth(unsigned int cp);
 static int npaint;
 
 static int Viewable(const XcWindow *w) {
@@ -282,6 +291,7 @@ static void RepaintCells(int c0, int r0, int c1, int r1) {
   if (c1 > xc.shm->cols) c1 = xc.shm->cols;
   if (r1 > xc.shm->rows) r1 = xc.shm->rows;
   if (c0 >= c1 || r0 >= r1) return;
+  ++xc.shm->damage;
   size_t cap = (size_t)(r1 - r0) * ((size_t)(c1 - c0) * 24 + 32) + 16;
   char *buf = malloc(cap);
   if (buf == NULL) return;
@@ -304,6 +314,94 @@ static void RepaintCells(int c0, int r0, int c1, int r1) {
       }
       buf[len++] = ' ';
     }
+  }
+  Out(buf, len);
+  free(buf);
+}
+
+int XcViewable(const XcWindow *w) { return Viewable(w); }
+
+unsigned long XcWindowBackground(const XcWindow *w) {
+  return EffectiveBackground(w);
+}
+
+int XcWindowCellsLocked(const XcWindow *w, int *c0, int *r0, int *c1,
+                        int *r1) {
+  CellRect(w, c0, r0, c1, r1);
+  if (*c0 < 0) *c0 = 0;
+  if (*r0 < 0) *r0 = 0;
+  if (*c1 > xc.shm->cols) *c1 = xc.shm->cols;
+  if (*r1 > xc.shm->rows) *r1 = xc.shm->rows;
+  return *c0 < *c1 && *r0 < *r1;
+}
+
+int XcPrintableCell(uint32_t cp) {
+  if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0) || cp >= 0x110000 ||
+      (cp >= 0xd800 && cp < 0xe000)) {
+    return 0;
+  }
+  return CellWidth(cp) == 1;
+}
+
+static size_t PutUtf8(char *buf, uint32_t cp) {
+  if (cp < 0x80) {
+    buf[0] = (char)cp;
+    return 1;
+  }
+  if (cp < 0x800) {
+    buf[0] = (char)(0xc0 | (cp >> 6));
+    buf[1] = (char)(0x80 | (cp & 0x3f));
+    return 2;
+  }
+  if (cp < 0x10000) {
+    buf[0] = (char)(0xe0 | (cp >> 12));
+    buf[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+    buf[2] = (char)(0x80 | (cp & 0x3f));
+    return 3;
+  }
+  buf[0] = (char)(0xf0 | (cp >> 18));
+  buf[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+  buf[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
+  buf[3] = (char)(0x80 | (cp & 0x3f));
+  return 4;
+}
+
+void XcPaintGridLocked(const XcWindow *w, int cols, int rows,
+                       const XcGridCell *grid, const uint32_t *list, int n) {
+  if (!Viewable(w)) return;
+  BuildPaintOrder();
+  int i = PaintIndex(w);
+  int wc0, wr0, wc1, wr1;
+  if (i < 0) return;
+  CellRect(w, &wc0, &wr0, &wc1, &wr1);
+  int total = n < 0 ? cols * rows : n;
+  // At most a cursor move, a colour change and 4 bytes per cell.
+  char *buf = malloc((size_t)total * 40 + 16);
+  if (buf == NULL) return;
+  size_t len = 0;
+  int at_c = -1, at_r = -1;
+  unsigned long cur_fg = (unsigned long)-1, cur_bg = (unsigned long)-1;
+  for (int k = 0; k < total; ++k) {
+    uint32_t idx = n < 0 ? (uint32_t)k : list[k];
+    if (idx >= (uint32_t)(cols * rows)) continue;
+    int c = wc0 + (int)idx % cols, r = wr0 + (int)idx / cols;
+    if (c < paint[i].c0 || c >= paint[i].c1 || r < paint[i].r0 ||
+        r >= paint[i].r1 || Covered(i, c, r)) {
+      continue;
+    }
+    const XcGridCell *g = &grid[idx];
+    if (c != at_c || r != at_r) {
+      len += (size_t)sprintf(buf + len, "\033[%d;%dH", r + 1, c + 1);
+      cur_fg = cur_bg = (unsigned long)-1;
+    }
+    if (g->fg != cur_fg || g->bg != cur_bg) {
+      Sgr(buf, &len, g->fg & 15, g->bg & 15);
+      cur_fg = g->fg;
+      cur_bg = g->bg;
+    }
+    len += PutUtf8(buf + len, XcPrintableCell(g->cp) ? g->cp : ' ');
+    at_c = c + 1;
+    at_r = r;
   }
   Out(buf, len);
   free(buf);
@@ -350,11 +448,13 @@ static void ClearVisible(XcWindow *w) {
 // ---------------------------------------------------------------------------
 // Display.
 
-static int ParseConnection(const char *name, int *draw_fd, int *shm_fd) {
+static int ParseConnection(const char *name, int *draw_fd, int *shm_fd,
+                           int *saver_fd) {
   if (name == NULL || strncmp(name, DISPLAY_PREFIX, strlen(DISPLAY_PREFIX))) {
     return 0;
   }
-  return sscanf(name + strlen(DISPLAY_PREFIX), "%d:%d", draw_fd, shm_fd) == 2;
+  return sscanf(name + strlen(DISPLAY_PREFIX), "%d:%d:%d", draw_fd, shm_fd,
+                saver_fd) == 3;
 }
 
 static void FontCell(int fd, int *cw, int *ch) {
@@ -457,6 +557,15 @@ static Display *OpenMain(void) {
   xc.shm->natoms = 0;
 
   if (!XcVtOpen()) return NULL;
+  // The saver channel: saver modules connect to the lock through the end
+  // every helper inherits (saver.c); the lock keeps the other.
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0) {
+    LogErrno("socketpair");
+    return NULL;
+  }
+  fcntl(sv[0], F_SETFD, FD_CLOEXEC);
+  xc.saver_fd = sv[0];
   ScreenSize();
   unsigned char cmap[48];
   if (ioctl(xc.vt_fd, GIO_CMAP, cmap) == 0) {
@@ -480,7 +589,8 @@ static Display *OpenMain(void) {
   root->owner = getpid();
 
   char name[64];
-  snprintf(name, sizeof(name), DISPLAY_PREFIX "%d:%d", xc.draw_fd, xc.shm_fd);
+  snprintf(name, sizeof(name), DISPLAY_PREFIX "%d:%d:%d", xc.draw_fd,
+           xc.shm_fd, sv[1]);
   setenv("DISPLAY", name, 1);
   the_display.d.fd = xc.vt_fd;
   the_display.d.display_name = strdup(name);
@@ -491,17 +601,21 @@ static Display *OpenMain(void) {
   RepaintCells(0, 0, xc.shm->cols, xc.shm->rows);
 
   if (!XcVtDropPrivileges()) return NULL;
+  // After dropping privileges: capabilities are per thread.
+  if (!XcSaverServerStart()) return NULL;
   return dpy_ptr;
 }
 
-static Display *OpenHelper(int draw_fd, int shm_fd) {
+static Display *OpenHelper(int draw_fd, int shm_fd, int saver_fd) {
   // A helper's own children (authproto_pam, the saver run by
-  // saver_multiplex, e.g. sleep) draw nothing: they do not get the lock VT
-  // or the window table, and a dumpable one cannot hand them to the user's
-  // other processes through /proc/<pid>/fd.
+  // saver_multiplex, e.g. sleep) do not get the lock VT or the window table,
+  // and a dumpable one cannot hand them to the user's other processes
+  // through /proc/<pid>/fd. They keep the saver channel (saver_fd): a saver
+  // module draws into its saver window through the lock (saver.c).
   fcntl(draw_fd, F_SETFD, FD_CLOEXEC);
   fcntl(shm_fd, F_SETFD, FD_CLOEXEC);
   xc.is_main = 0;
+  xc.saver_fd = saver_fd;
   xc.draw_fd = draw_fd;
   xc.shm_fd = shm_fd;
   xc.shm = mmap(NULL, sizeof(XcShared), PROT_READ | PROT_WRITE, MAP_SHARED,
@@ -519,9 +633,9 @@ static Display *OpenHelper(int draw_fd, int shm_fd) {
 Display *XOpenDisplay(const char *name) {
   if (xc.shm != NULL) return dpy_ptr;
   if (name == NULL) name = getenv("DISPLAY");
-  int draw_fd, shm_fd;
-  if (ParseConnection(name, &draw_fd, &shm_fd)) {
-    return OpenHelper(draw_fd, shm_fd);
+  int draw_fd, shm_fd, saver_fd;
+  if (ParseConnection(name, &draw_fd, &shm_fd, &saver_fd)) {
+    return OpenHelper(draw_fd, shm_fd, saver_fd);
   }
   return OpenMain();
 }
@@ -529,6 +643,7 @@ Display *XOpenDisplay(const char *name) {
 int XCloseDisplay(Display *dpy) {
   (void)dpy;
   if (xc.is_main) {
+    XcSaverServerStop();
     XcVtRelease(1);
   }
   return 0;
@@ -707,6 +822,12 @@ static int SetMapped(Window w, int mapped, int raise) {
   win->mapped = mapped;
   if (raise) win->stack = xc.shm->next_stack++;
   if (changed || raise) RepaintWindowArea(win);
+  if (changed && mapped && w == xc.shm->auth_window) {
+    // The prompt shows: the saver window goes blank now, not when the saver
+    // channel's thread next looks (saver.c).
+    XcWindow *saver = XcFindWindow(xc.shm->saver_window);
+    if (saver != NULL && Viewable(saver)) RepaintWindowArea(saver);
+  }
   XcUnlock();
   if (changed) {
     QueueWindowEvent(mapped ? MapNotify : UnmapNotify, w);
@@ -762,6 +883,21 @@ int XConfigureWindow(Display *dpy, Window w, unsigned int mask,
   return 1;
 }
 
+//! The children of w that covered it exactly (old size) get its new size,
+//! and so on down (XMoveResizeWindow).
+static void FollowResize(Window w, int ow, int oh, int nw, int nh, int depth) {
+  if (depth >= XC_MAX_WINDOWS) return;
+  for (int k = 0; k < XC_MAX_WINDOWS; ++k) {
+    XcWindow *c = &xc.shm->windows[k];
+    if (c->id != 0 && c->parent == w && c->x == 0 && c->y == 0 &&
+        c->w == ow && c->h == oh) {
+      FollowResize(c->id, ow, oh, nw, nh, depth + 1);
+      c->w = nw;
+      c->h = nh;
+    }
+  }
+}
+
 int XMoveResizeWindow(Display *dpy, Window w, int x, int y,
                       unsigned int width, unsigned int height) {
   (void)dpy;
@@ -779,6 +915,13 @@ int XMoveResizeWindow(Display *dpy, Window w, int x, int y,
   int viewable = Viewable(win);
   int c0, r0, c1, r1;
   CellRect(win, &c0, &r0, &c1, &r1);
+  // Children that covered the window exactly keep covering it, and theirs
+  // them. This stands in for XRandR, which the console lacks: under X a
+  // screen change makes saver_multiplex recreate its per-monitor windows
+  // (and savers) at the new size; here the screen is one monitor, and its
+  // window follows the windows main.c resizes with the screen (a rotated
+  // console).
+  FollowResize(w, win->w, win->h, (int)width, (int)height, 0);
   win->x = x;
   win->y = y;
   win->w = (int)width;
@@ -1372,14 +1515,27 @@ void XSetWMProperties(Display *dpy, Window w, XTextProperty *window_name,
                       XSizeHints *normal_hints, XWMHints *wm_hints,
                       XClassHint *class_hints) {
   (void)dpy;
-  (void)w;
   (void)window_name;
+  // xsecurelock names its windows (wm_properties.c); saver modules may draw
+  // inside the one it names "saver" only, and not while the one it names
+  // "auth" (the prompt) shows (saver.c).
+  if (xc.is_main && class_hints != NULL && class_hints->res_name != NULL &&
+      class_hints->res_class != NULL &&
+      !strcmp(class_hints->res_class, "xsecurelock")) {
+    XcLock();
+    if (xc_saver_window == None && !strcmp(class_hints->res_name, "saver")) {
+      xc_saver_window = xc.shm->saver_window = w;
+    }
+    if (xc_auth_window == None && !strcmp(class_hints->res_name, "auth")) {
+      xc_auth_window = xc.shm->auth_window = w;
+    }
+    XcUnlock();
+  }
   (void)icon_name;
   (void)argv;
   (void)argc;
   (void)normal_hints;
   (void)wm_hints;
-  (void)class_hints;
 }
 
 Window XmuClientWindow(Display *dpy, Window w) {
@@ -1574,3 +1730,4 @@ int XBell(Display *dpy, int percent) {
   ioctl(xc.draw_fd, KDMKTONE, arg);
   return 1;
 }
+
