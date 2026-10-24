@@ -28,6 +28,7 @@ limitations under the License.
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/kd.h>
@@ -60,10 +61,14 @@ static struct {
 
 static Display *const dpy_ptr = (Display *)&the_display;
 
-// Events (main program only).
-#define EVENT_QUEUE 256
-static XEvent event_queue[EVENT_QUEUE];
-static int eq_head, eq_len;
+// Events (main program only): a ring that grows, so that nothing is
+// dropped however much arrives before the program reads it.
+typedef struct {
+  XEvent ev;
+  XcKeyText key;  // for key events: what XLookupString will give
+} QueuedEvent;
+static QueuedEvent *event_queue;
+static int eq_cap, eq_head, eq_len;
 
 // Input masks selected by this process.
 static struct {
@@ -88,9 +93,30 @@ XcWindow *XcFindWindow(Window w) {
   return NULL;
 }
 
-void XcQueueEvent(const XEvent *ev) {
-  if (!xc.is_main || eq_len >= EVENT_QUEUE) return;
-  event_queue[(eq_head + eq_len) % EVENT_QUEUE] = *ev;
+void XcQueueEvent(const XEvent *ev) { XcQueueKeyEvent(ev, NULL); }
+
+void XcQueueKeyEvent(const XEvent *ev, const XcKeyText *key) {
+  if (!xc.is_main) return;
+  if (eq_len == eq_cap) {
+    int cap = eq_cap ? eq_cap * 2 : 256;
+    QueuedEvent *q = malloc(sizeof(QueuedEvent) * (size_t)cap);
+    if (q == NULL) {
+      Log("xconsole: out of memory for events");
+      return;
+    }
+    for (int i = 0; i < eq_len; ++i) q[i] = event_queue[(eq_head + i) % eq_cap];
+    free(event_queue);
+    event_queue = q;
+    eq_cap = cap;
+    eq_head = 0;
+  }
+  QueuedEvent *e = &event_queue[(eq_head + eq_len) % eq_cap];
+  e->ev = *ev;
+  if (key != NULL) {
+    e->key = *key;
+  } else {
+    memset(&e->key, 0, sizeof(e->key));
+  }
   ++eq_len;
 }
 
@@ -540,12 +566,22 @@ static void CheckScreenSize(void) {
   }
 }
 
+//! Read all the keyboard input there is (waiting up to timeout_ms for
+//! some, less if a key repeat is due first), and queue the key repeats due.
 static void ReadInput(int timeout_ms) {
+  int repeat_ms = XcKeyboardTimeoutMs();
+  if (repeat_ms >= 0 && (timeout_ms < 0 || repeat_ms < timeout_ms)) {
+    timeout_ms = repeat_ms;
+  }
   struct pollfd pfd = {xc.vt_fd, POLLIN, 0};
-  if (poll(&pfd, 1, timeout_ms) <= 0) return;
-  unsigned char buf[256];
-  ssize_t n = read(xc.vt_fd, buf, sizeof(buf));
-  if (n > 0) XcKeyboardInput(dpy_ptr, buf, (size_t)n);
+  while (poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLIN)) {
+    unsigned char buf[256];
+    ssize_t n = read(xc.vt_fd, buf, sizeof(buf));
+    if (n <= 0) break;
+    XcKeyboardInput(dpy_ptr, buf, (size_t)n);
+    timeout_ms = 0;
+  }
+  XcKeyboardTick(dpy_ptr);
 }
 
 int XPending(Display *dpy) {
@@ -567,8 +603,11 @@ int XNextEvent(Display *dpy, XEvent *ev) {
     memset(ev, 0, sizeof(*ev));
     return 0;
   }
-  *ev = event_queue[eq_head];
-  eq_head = (eq_head + 1) % EVENT_QUEUE;
+  *ev = event_queue[eq_head].ev;
+  if (ev->type == KeyPress || ev->type == KeyRelease) {
+    XcKeyDequeued(ev->xkey.serial, &event_queue[eq_head].key);
+  }
+  eq_head = (eq_head + 1) % eq_cap;
   --eq_len;
   return 0;
 }
@@ -868,65 +907,122 @@ struct _XGC {
   unsigned long background;
 };
 
-static const struct {
-  const char *name;
-  unsigned char r, g, b;
-} color_names[] = {
-    {"black", 0, 0, 0},         {"white", 255, 255, 255},
-    {"red", 255, 0, 0},         {"green", 0, 255, 0},
-    {"blue", 0, 0, 255},        {"yellow", 255, 255, 0},
-    {"cyan", 0, 255, 255},      {"magenta", 255, 0, 255},
-    {"gray", 190, 190, 190},    {"grey", 190, 190, 190},
-    {"orange", 255, 165, 0},    {"purple", 160, 32, 240},
-    {"darkgray", 169, 169, 169}, {"darkgrey", 169, 169, 169},
-    {"lightgray", 211, 211, 211}, {"lightgrey", 211, 211, 211},
-};
+// The X server's colour names (xserver os/oscolor.c).
+typedef struct {
+  unsigned char red, green, blue;
+  unsigned short name;
+} XcBuiltinColor;
+#include "xcolors.inc"
 
-static int ParseColor(const char *spec, int *r, int *g, int *b) {
-  if (spec[0] == '#') {
-    unsigned int v;
-    size_t n = strlen(spec + 1);
-    if (n == 6 && sscanf(spec + 1, "%6x", &v) == 1) {
-      *r = (v >> 16) & 0xff;
-      *g = (v >> 8) & 0xff;
-      *b = v & 0xff;
+//! xserver's OsLookupColor (os/oscolor.c): case-insensitive, whole name.
+static int OsLookupColor(const char *name, unsigned short *pred,
+                         unsigned short *pgreen, unsigned short *pblue) {
+  size_t len = strlen(name);
+  int low = 0, high = (int)(sizeof(BuiltinColors) / sizeof(*BuiltinColors)) - 1;
+  while (high >= low) {
+    int mid = (low + high) / 2;
+    const XcBuiltinColor *c = &BuiltinColors[mid];
+    int r = strncasecmp(&BuiltinColorNames[c->name], name, len);
+    if (r == 0 && len == strlen(&BuiltinColorNames[c->name])) {
+      *pred = (unsigned short)(c->red * 0x101);
+      *pgreen = (unsigned short)(c->green * 0x101);
+      *pblue = (unsigned short)(c->blue * 0x101);
       return 1;
     }
-    if (n == 3 && sscanf(spec + 1, "%3x", &v) == 1) {
-      *r = ((v >> 8) & 0xf) * 17;
-      *g = ((v >> 4) & 0xf) * 17;
-      *b = (v & 0xf) * 17;
-      return 1;
-    }
-    return 0;
+    if (r < 0)
+      low = mid + 1;
+    else
+      high = mid - 1;
   }
-  for (size_t i = 0; i < sizeof(color_names) / sizeof(color_names[0]); ++i) {
-    if (!strcasecmp(spec, color_names[i].name)) {
-      *r = color_names[i].r;
-      *g = color_names[i].g;
-      *b = color_names[i].b;
-      return 1;
+  return 0;
+}
+
+/*! \brief A colour spec as XAllocNamedColor resolves it: Xcms first (the
+ * spec lowercased; "#" and "rgb:" as libX11's XcmsLRGB_RGB_ParseString,
+ * "rgbi:" as XcmsLRGB_RGBi_ParseString, src/xcms/LRGB.c), then the server's
+ * colour names. The device-independent Xcms spaces (CIEXYZ:, CIEuvY:,
+ * CIExyY:, CIELab:, CIELuv:, TekHVC:) are not supported.
+ * \return 1 and 16-bit RGB on success. */
+static int ParseColor(const char *spec, unsigned short *r, unsigned short *g,
+                      unsigned short *b) {
+  char lowered[256];
+  size_t n = strlen(spec);
+  if (n >= sizeof(lowered)) return 0;
+  for (size_t i = 0; i <= n; ++i) lowered[i] = (char)tolower((unsigned char)spec[i]);
+  const char *p = lowered;
+  if (*p == '#') {
+    ++p;
+    n = strlen(p);
+    if (n != 3 && n != 6 && n != 9 && n != 12) return 0;
+    n /= 3;
+    unsigned short v[3] = {0, 0, 0};
+    for (int k = 0; k < 3; ++k) {
+      for (size_t i = 0; i < n; ++i) {
+        char c = *p++;
+        v[k] = (unsigned short)(v[k] << 4);
+        if (c >= '0' && c <= '9')
+          v[k] |= (unsigned short)(c - '0');
+        else if (c >= 'a' && c <= 'f')
+          v[k] |= (unsigned short)(c - ('a' - 10));
+        else
+          return 0;
+      }
+      // Shift instead of scale, to match old broken semantics (libX11).
+      v[k] = (unsigned short)(v[k] << (16 - 4 * n));
+    }
+    *r = v[0];
+    *g = v[1];
+    *b = v[2];
+    return 1;
+  }
+  if (!strncmp(p, "rgb:", 4)) {
+    p += 4;
+    unsigned short v[3];
+    for (int k = 0; k < 3; ++k, ++p) {
+      int digits = 0;
+      unsigned long x = 0;
+      while (*p != '/' && *p != '\0') {
+        if (++digits > 4) return 0;
+        char c = *p++;
+        x <<= 4;
+        if (c >= '0' && c <= '9')
+          x |= (unsigned long)(c - '0');
+        else if (c >= 'a' && c <= 'f')
+          x |= (unsigned long)(c - ('a' - 10));
+        else
+          return 0;
+      }
+      if (digits == 0) return 0;
+      if (digits < 4) x = x * 0xFFFF / ((1ul << (digits * 4)) - 1);
+      v[k] = (unsigned short)x;
+      if (k < 2 && *p != '/') return 0;
+    }
+    *r = v[0];
+    *g = v[1];
+    *b = v[2];
+    return 1;
+  }
+  if (!strncmp(p, "rgbi:", 5)) {
+    double v[3];
+    if (sscanf(p + 5, "%lf/%lf/%lf", &v[0], &v[1], &v[2]) != 3) return 0;
+    for (int k = 0; k < 3; ++k) {
+      if (v[k] < 0.0 || v[k] > 1.0) return 0;
+    }
+    // Linear, where Xcms goes through the screen's intensity tables.
+    *r = (unsigned short)(v[0] * 65535.0 + 0.5);
+    *g = (unsigned short)(v[1] * 65535.0 + 0.5);
+    *b = (unsigned short)(v[2] * 65535.0 + 0.5);
+    return 1;
+  }
+  static const char *const xcms_spaces[] = {"ciexyz:", "cieuvy:", "ciexyy:",
+                                            "cielab:", "cieluv:", "tekhvc:"};
+  for (size_t i = 0; i < sizeof(xcms_spaces) / sizeof(*xcms_spaces); ++i) {
+    if (!strncmp(p, xcms_spaces[i], strlen(xcms_spaces[i]))) {
+      Log("xconsole: colour space of \"%s\" is not supported", spec);
+      return 0;
     }
   }
-  // X's color database, if installed.
-  FILE *f = fopen("/usr/share/X11/rgb.txt", "r");
-  if (f == NULL) return 0;
-  char line[256];
-  int found = 0;
-  while (!found && fgets(line, sizeof(line), f)) {
-    int lr, lg, lb, off = 0;
-    if (sscanf(line, " %d %d %d %n", &lr, &lg, &lb, &off) != 3) continue;
-    char *nm = line + off;
-    nm[strcspn(nm, "\r\n")] = 0;
-    if (!strcasecmp(nm, spec)) {
-      *r = lr;
-      *g = lg;
-      *b = lb;
-      found = 1;
-    }
-  }
-  fclose(f);
-  return found;
+  return OsLookupColor(spec, r, g, b);
 }
 
 static void PixelColor(unsigned long pixel, XColor *c) {
@@ -938,16 +1034,25 @@ static void PixelColor(unsigned long pixel, XColor *c) {
   c->flags = DoRed | DoGreen | DoBlue;
 }
 
+/*! \brief As X: the nearest console colour to the named one. On failure
+ * both colours are set to black (X leaves them as they were; auth_x11 does
+ * not check the result, and an uninitialised colour must not decide what
+ * the prompt looks like). */
 Status XAllocNamedColor(Display *dpy, Colormap cmap, const char *name,
                         XColor *screen_def, XColor *exact_def) {
   (void)dpy;
   (void)cmap;
-  int r, g, b;
-  if (!ParseColor(name, &r, &g, &b)) return 0;
-  exact_def->red = (unsigned short)(r * 257);
-  exact_def->green = (unsigned short)(g * 257);
-  exact_def->blue = (unsigned short)(b * 257);
-  PixelColor(NearestColor(r, g, b), screen_def);
+  unsigned short r, g, b;
+  if (name == NULL || !ParseColor(name, &r, &g, &b)) {
+    PixelColor(the_display.screen.black_pixel, screen_def);
+    *exact_def = *screen_def;
+    return 0;
+  }
+  exact_def->red = r;
+  exact_def->green = g;
+  exact_def->blue = b;
+  exact_def->flags = DoRed | DoGreen | DoBlue;
+  PixelColor(NearestColor(r >> 8, g >> 8, b >> 8), screen_def);
   exact_def->pixel = screen_def->pixel;
   return 1;
 }
@@ -1184,7 +1289,19 @@ Atom XcInternAtom(const char *name) {
 
 Atom XInternAtom(Display *dpy, const char *name, Bool only_if_exists) {
   (void)dpy;
-  (void)only_if_exists;
+  if (only_if_exists) {
+    for (size_t i = 1;
+         i < sizeof(predefined_atoms) / sizeof(*predefined_atoms); ++i) {
+      if (!strcmp(predefined_atoms[i], name)) return (Atom)i;
+    }
+    Atom a = None;
+    XcLock();
+    for (int i = 0; i < xc.shm->natoms; ++i) {
+      if (!strcmp(xc.shm->atoms[i], name)) a = (Atom)(XC_FIRST_ATOM + i);
+    }
+    XcUnlock();
+    return a;
+  }
   return XcInternAtom(name);
 }
 

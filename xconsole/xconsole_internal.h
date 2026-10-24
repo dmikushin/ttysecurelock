@@ -77,7 +77,8 @@ typedef struct {
   int num_groups;
   int group;
   unsigned int leds;  // bit 0 Scroll, 1 Num, 2 Caps (console LED flags)
-  unsigned int locks;  // the console's lock state (1 << KG_SHIFT, ...)
+  unsigned int locks;    // the console's lock state (1 << KG_SHIFT, ...)
+  unsigned int latches;  // the console's sticky (latched) shifts
   char group_names[2][XC_ATOM_NAME];
 } XcShared;
 
@@ -102,11 +103,18 @@ extern XcConn xc;
 //! The user to lock for (--user), who must own the VT in front.
 extern const char *xc_lock_user;
 
+//! The translation of a key event, queued with it.
+typedef struct {
+  KeySym keysym;
+  char text[16];
+} XcKeyText;
+
 // display.c
 void XcLock(void);
 void XcUnlock(void);
 XcWindow *XcFindWindow(Window w);
 void XcQueueEvent(const XEvent *ev);
+void XcQueueKeyEvent(const XEvent *ev, const XcKeyText *key);
 Atom XcInternAtom(const char *name);
 
 // keyboard.c
@@ -115,6 +123,12 @@ void XcKeyboardSetMode(int vt_fd);
 void XcKeyboardRestore(int vt_fd);
 //! Feed raw K_MEDIUMRAW bytes; queues KeyPress/KeyRelease events.
 void XcKeyboardInput(Display *dpy, const unsigned char *buf, size_t len);
+//! A key event leaves the queue: keep its translation for XLookupString.
+void XcKeyDequeued(unsigned long serial, const XcKeyText *key);
+//! X's autorepeat: queue the repeats that are due.
+void XcKeyboardTick(Display *dpy);
+//! Milliseconds until the next repeat, or -1.
+int XcKeyboardTimeoutMs(void);
 
 // vt.c
 int XcVtOpen(void);

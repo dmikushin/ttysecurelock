@@ -41,6 +41,7 @@ limitations under the License.
 #include <linux/keyboard.h>
 #include <linux/uinput.h>
 #include <fcntl.h>
+#include <glob.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,16 +64,15 @@ static unsigned int shift_state;
 static unsigned int lockstate;   // KG_ALTGR bit mirrors shm->group
 static unsigned int slockstate;
 static unsigned int diacr;
-static int super_down;
 static unsigned char key_down[NKEYS / 8];
 static int saved_kbd_mode = K_UNICODE;
 
-// Last translations, looked up by XLookupString / XmbLookupString.
+// Translations of the key events that left the queue last, looked up by
+// XLookupString / XmbLookupString (the queue keeps those of the others).
 #define TEXT_RING 64
 static struct {
   unsigned long serial;
-  KeySym keysym;
-  char text[16];
+  XcKeyText key;
 } text_ring[TEXT_RING];
 static unsigned long next_serial = 1;
 
@@ -87,117 +87,324 @@ static const char *const indicator_names[] = {
 #define IND_SHIFT_LOCK 11
 #define IND_GROUP_2 12
 
-//! Keys X maps to fixed keysyms whatever the layout (evdev keycodes).
-static const struct {
-  unsigned char keycode;
-  KeySym keysym;
-  const char *text;
-} named_keys[] = {
-    {1, XK_Escape, "\033"},
-    {14, XK_BackSpace, "\b"},
-    {15, XK_Tab, "\t"},
-    {28, XK_Return, "\r"},
-    {96, XK_KP_Enter, "\r"},
-    {111, XK_Delete, "\177"},
-    {29, XK_Control_L, ""},
-    {97, XK_Control_R, ""},
-    {42, XK_Shift_L, ""},
-    {54, XK_Shift_R, ""},
-    {56, XK_Alt_L, ""},
-    {100, XK_Alt_R, ""},
-    {125, XK_Super_L, ""},
-    {126, XK_Super_R, ""},
-    {58, XK_Caps_Lock, ""},
-    {69, XK_Num_Lock, ""},
-    {70, XK_Scroll_Lock, ""},
-    {127, XK_Menu, ""},
-    {59, XK_F1, ""},
-    {60, XK_F2, ""},
-    {61, XK_F3, ""},
-    {62, XK_F4, ""},
-    {63, XK_F5, ""},
-    {64, XK_F6, ""},
-    {65, XK_F7, ""},
-    {66, XK_F8, ""},
-    {67, XK_F9, ""},
-    {68, XK_F10, ""},
-    {87, XK_F11, ""},
-    {88, XK_F12, ""},
-    {102, XK_Home, ""},
-    {103, XK_Up, ""},
-    {104, XK_Prior, ""},
-    {105, XK_Left, ""},
-    {106, XK_Right, ""},
-    {107, XK_End, ""},
-    {108, XK_Down, ""},
-    {109, XK_Next, ""},
-    {110, XK_Insert, ""},
-    {119, XK_Pause, ""},
-    {99, XK_Print, ""},
-    {113, 0x1008ff12, ""},  // XF86AudioMute
-    {114, 0x1008ff11, ""},  // XF86AudioLowerVolume
-    {115, 0x1008ff13, ""},  // XF86AudioRaiseVolume
-    {163, 0x1008ff17, ""},  // XF86AudioNext
-    {164, 0x1008ff14, ""},  // XF86AudioPlay
-    {165, 0x1008ff16, ""},  // XF86AudioPrev
-    {224, 0x1008ff03, ""},  // XF86MonBrightnessDown
-    {225, 0x1008ff02, ""},  // XF86MonBrightnessUp
-};
+// X's own data for the user's keymap: fixed keys, key types, autorepeat,
+// modifier map, keysym names, Unicode keysyms (scripts/gen-xconsole-tables.py).
+#include "xkeys.inc"
 
-static const struct {
-  KeySym keysym;
-  const char *name;
-} keysym_names[] = {
-    {XK_Escape, "Escape"},
-    {XK_BackSpace, "BackSpace"},
-    {XK_Tab, "Tab"},
-    {XK_Return, "Return"},
-    {XK_KP_Enter, "KP_Enter"},
-    {XK_Delete, "Delete"},
-    {XK_Control_L, "Control_L"},
-    {XK_Control_R, "Control_R"},
-    {XK_Shift_L, "Shift_L"},
-    {XK_Shift_R, "Shift_R"},
-    {XK_Alt_L, "Alt_L"},
-    {XK_Alt_R, "Alt_R"},
-    {XK_Super_L, "Super_L"},
-    {XK_Super_R, "Super_R"},
-    {XK_Caps_Lock, "Caps_Lock"},
-    {XK_Num_Lock, "Num_Lock"},
-    {XK_Scroll_Lock, "Scroll_Lock"},
-    {XK_Menu, "Menu"},
-    {XK_F1, "F1"},
-    {XK_F2, "F2"},
-    {XK_F3, "F3"},
-    {XK_F4, "F4"},
-    {XK_F5, "F5"},
-    {XK_F6, "F6"},
-    {XK_F7, "F7"},
-    {XK_F8, "F8"},
-    {XK_F9, "F9"},
-    {XK_F10, "F10"},
-    {XK_F11, "F11"},
-    {XK_F12, "F12"},
-    {XK_Home, "Home"},
-    {XK_Up, "Up"},
-    {XK_Prior, "Prior"},
-    {XK_Left, "Left"},
-    {XK_Right, "Right"},
-    {XK_End, "End"},
-    {XK_Down, "Down"},
-    {XK_Next, "Next"},
-    {XK_Insert, "Insert"},
-    {XK_Pause, "Pause"},
-    {XK_Print, "Print"},
-    {0x1008ff12, "XF86AudioMute"},
-    {0x1008ff11, "XF86AudioLowerVolume"},
-    {0x1008ff13, "XF86AudioRaiseVolume"},
-    {0x1008ff17, "XF86AudioNext"},
-    {0x1008ff14, "XF86AudioPlay"},
-    {0x1008ff16, "XF86AudioPrev"},
-    {0x1008ff03, "XF86MonBrightnessDown"},
-    {0x1008ff02, "XF86MonBrightnessUp"},
-};
+// X's autorepeat (xserver xkb/xkbAccessX.c: XkbDfltRepeatDelay/Interval).
+#define REPEAT_DELAY_MS 660
+#define REPEAT_INTERVAL_MS 40
+static unsigned int repeat_key;  // 0: none
+static long long repeat_next_ms;
+
+// X keycodes are evdev keycodes + 8, at most 255.
+#define MAX_EVDEV_KEYCODE (255 - 8)
+
+static const struct XcFixedKey *FixedKey(unsigned int keycode) {
+  for (size_t i = 0; i < sizeof(xc_fixed_keys) / sizeof(xc_fixed_keys[0]);
+       ++i) {
+    if (xc_fixed_keys[i].code == keycode) return &xc_fixed_keys[i];
+  }
+  return NULL;
+}
+
+//! The X modifiers of console shift bits (locks and latches).
+static unsigned int KgMods(unsigned int kg) {
+  unsigned int m = 0;
+  if (kg & ((1u << KG_SHIFT) | (1u << KG_SHIFTL) | (1u << KG_SHIFTR))) {
+    m |= ShiftMask;
+  }
+  if (kg & ((1u << KG_CTRL) | (1u << KG_CTRLL) | (1u << KG_CTRLR))) {
+    m |= ControlMask;
+  }
+  if (kg & (1u << KG_ALT)) m |= Mod1Mask;
+  if (kg & (1u << KG_ALTGR)) m |= Mod5Mask;
+  return m;
+}
+
+/*! \brief libX11's _XTranslateKeySym (src/KeyBind.c) for keysyms that are
+ * not characters of the layout: the text X gives them. */
+static size_t TranslateKeySym(KeySym symbol, unsigned int modifiers,
+                              char *buffer) {
+  unsigned long hiBytes = symbol >> 8;
+  if (!symbol) return 0;
+  if (!((hiBytes == 0) ||
+        ((hiBytes == 0xFF) &&
+         (((symbol >= XK_BackSpace) && (symbol <= XK_Clear)) ||
+          (symbol == XK_Return) || (symbol == XK_Escape) ||
+          (symbol == XK_KP_Space) || (symbol == XK_KP_Tab) ||
+          (symbol == XK_KP_Enter) ||
+          ((symbol >= XK_KP_Multiply) && (symbol <= XK_KP_9)) ||
+          (symbol == XK_KP_Equal) || (symbol == XK_Delete))))) {
+    return 0;
+  }
+  unsigned char c;
+  if (symbol == XK_KP_Space)
+    c = XK_space & 0x7F;
+  else if (hiBytes == 0xFF)
+    c = symbol & 0x7F;
+  else
+    c = symbol & 0xFF;
+  if (modifiers & ControlMask) {
+    if ((c >= '@' && c < '\177') || c == ' ')
+      c &= 0x1F;
+    else if (c == '2')
+      c = '\000';
+    else if (c >= '3' && c <= '7')
+      c -= ('3' - '\033');
+    else if (c == '8')
+      c = '\177';
+    else if (c == '/')
+      c = '_' & 0x1F;
+  }
+  buffer[0] = (char)c;
+  return 1;
+}
+
+//! The keysym of a fixed key at the level its key type gives the state.
+static KeySym FixedKeysym(const struct XcFixedKey *k, unsigned int state) {
+  const struct XcKeyType *t = &xc_key_types[k->type];
+  unsigned int mods = state & t->mods;
+  int level = 1;
+  for (int i = 0; i < t->n; ++i) {
+    if (t->map[i].mods == mods) {
+      level = t->map[i].level;
+      break;
+    }
+  }
+  if (level > 5 || k->syms[level - 1] == 0) return NoSymbol;
+  return k->syms[level - 1];
+}
+
+//! The keysym X gives a character (keysymdef.h), else its Unicode keysym.
+static KeySym UnicodeKeysym(unsigned int cp) {
+  if ((cp >= 0x20 && cp < 0x7f) || (cp >= 0xa0 && cp < 0x100)) return cp;
+  size_t lo = 0, hi = sizeof(xc_unicode_keysyms) / sizeof(xc_unicode_keysyms[0]);
+  while (lo < hi) {
+    size_t mid = (lo + hi) / 2;
+    if (xc_unicode_keysyms[mid].cp < cp) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  if (lo < sizeof(xc_unicode_keysyms) / sizeof(xc_unicode_keysyms[0]) &&
+      xc_unicode_keysyms[lo].cp == cp) {
+    return xc_unicode_keysyms[lo].keysym;
+  }
+  return 0x01000000 | cp;
+}
+
+static char *ReadFile(const char *path) {
+  FILE *f = fopen(path, "r");
+  if (f == NULL) return NULL;
+  size_t cap = 1 << 16, n = 0;
+  char *buf = malloc(cap + 1);
+  while (buf != NULL) {
+    size_t r = fread(buf + n, 1, cap - n, f);
+    n += r;
+    if (n < cap) break;
+    char *bigger = realloc(buf, cap * 2 + 1);
+    if (bigger == NULL) {
+      free(buf);
+      buf = NULL;
+      break;
+    }
+    buf = bigger;
+    cap *= 2;
+  }
+  fclose(f);
+  if (buf != NULL) buf[n] = 0;
+  return buf;
+}
+
+//! Split "a,b" into up to max fields of size XC_ATOM_NAME.
+static int SplitList(const char *list, char out[][XC_ATOM_NAME], int max) {
+  int n = 0;
+  while (n < max) {
+    size_t l = strcspn(list, ",");
+    if (l >= XC_ATOM_NAME) l = XC_ATOM_NAME - 1;
+    memcpy(out[n], list, l);
+    out[n][l] = 0;
+    ++n;
+    list += strcspn(list, ",");
+    if (*list != ',') break;
+    ++list;
+  }
+  return n;
+}
+
+//! The value of `Option "name" "value"` in an xorg.conf text, or 0.
+static int XorgOption(const char *text, const char *name, char *out,
+                      size_t size) {
+  char key[64];
+  snprintf(key, sizeof(key), "\"%s\"", name);
+  const char *p = text;
+  while ((p = strstr(p, key)) != NULL) {
+    const char *line = p;
+    while (line > text && line[-1] != '\n') --line;
+    const char *hash = memchr(line, '#', (size_t)(p - line));
+    p += strlen(key);
+    if (hash != NULL) continue;  // commented out
+    const char *q = strchr(p, '"');
+    const char *nl = strchr(p, '\n');
+    if (q == NULL || (nl != NULL && q > nl)) continue;
+    const char *e = strchr(q + 1, '"');
+    if (e == NULL) continue;
+    size_t l = (size_t)(e - q - 1);
+    if (l >= size) l = size - 1;
+    memcpy(out, q + 1, l);
+    out[l] = 0;
+    return 1;
+  }
+  return 0;
+}
+
+/*! \brief The XKB layouts configured for the system, as an X server would
+ * get them without a user's setxkbmap: XkbLayout/XkbVariant of
+ * /etc/X11/xorg.conf.d (what localectl set-x11-keymap writes), else the X
+ * layout systemd's kbd-model-map gives the console keymap of
+ * /etc/vconsole.conf (what localectl uses).
+ * \return the number of layouts (0: none configured). */
+static int ConfiguredLayouts(char layouts[][XC_ATOM_NAME],
+                             char variants[][XC_ATOM_NAME], int max,
+                             char *source, size_t source_size) {
+  char layout[256] = "", variant[256] = "";
+  glob_t g;
+  if (glob("/etc/X11/xorg.conf.d/*.conf", 0, NULL, &g) == 0) {
+    for (size_t i = 0; i < g.gl_pathc && !layout[0]; ++i) {
+      char *text = ReadFile(g.gl_pathv[i]);
+      if (text == NULL) continue;
+      if (XorgOption(text, "XkbLayout", layout, sizeof(layout))) {
+        XorgOption(text, "XkbVariant", variant, sizeof(variant));
+        snprintf(source, source_size, "%s", g.gl_pathv[i]);
+      }
+      free(text);
+    }
+    globfree(&g);
+  }
+  if (!layout[0]) {
+    char *vc = ReadFile("/etc/vconsole.conf");
+    char keymap[128] = "";
+    if (vc != NULL) {
+      for (char *line = strtok(vc, "\n"); line; line = strtok(NULL, "\n")) {
+        if (!strncmp(line, "KEYMAP=", 7)) {
+          snprintf(keymap, sizeof(keymap), "%s", line + 7);
+          keymap[strcspn(keymap, "\" \t")] = 0;
+        }
+      }
+      free(vc);
+    }
+    char *map = keymap[0] ? ReadFile("/usr/share/systemd/kbd-model-map") : NULL;
+    if (map != NULL) {
+      for (char *line = strtok(map, "\n"); line; line = strtok(NULL, "\n")) {
+        char f[5][128];
+        if (line[0] == '#' ||
+            sscanf(line, "%127s %127s %127s %127s %127s", f[0], f[1], f[2],
+                   f[3], f[4]) < 4) {
+          continue;
+        }
+        if (strcmp(f[0], keymap)) continue;
+        snprintf(layout, sizeof(layout), "%s", f[1]);
+        snprintf(variant, sizeof(variant), "%s", strcmp(f[3], "-") ? f[3] : "");
+        snprintf(source, source_size,
+                 "/usr/share/systemd/kbd-model-map for KEYMAP=%s", keymap);
+        break;
+      }
+      free(map);
+    }
+  }
+  if (!layout[0]) return 0;
+  int n = SplitList(layout, layouts, max);
+  for (int i = 0; i < max; ++i) variants[i][0] = 0;
+  if (variant[0]) SplitList(variant, variants, max);
+  return n;
+}
+
+//! The text of the first <tag>...</tag> in [p, end), or 0.
+static int XmlText(const char *p, const char *end, const char *tag, char *out,
+                   size_t size) {
+  char open[64], close[64];
+  snprintf(open, sizeof(open), "<%s>", tag);
+  snprintf(close, sizeof(close), "</%s>", tag);
+  const char *a = strstr(p, open);
+  if (a == NULL || a >= end) return 0;
+  a += strlen(open);
+  const char *b = strstr(a, close);
+  if (b == NULL || b > end) return 0;
+  size_t l = (size_t)(b - a);
+  if (l >= size) l = size - 1;
+  memcpy(out, a, l);
+  out[l] = 0;
+  return 1;
+}
+
+/*! \brief The human name xkeyboard-config gives a layout (and variant): the
+ * group name an X server has for it (rules/evdev.xml). */
+static int LayoutDescription(const char *xml, const char *layout,
+                             const char *variant, char *out, size_t size) {
+  for (const char *p = strstr(xml, "<layout>"); p != NULL;
+       p = strstr(p + 1, "<layout>")) {
+    const char *end = strstr(p, "</layout>");
+    if (end == NULL) break;
+    char name[64];
+    if (!XmlText(p, end, "name", name, sizeof(name)) || strcmp(name, layout)) {
+      continue;
+    }
+    if (!variant[0]) return XmlText(p, end, "description", out, size);
+    for (const char *v = strstr(p, "<variant>"); v != NULL && v < end;
+         v = strstr(v + 1, "<variant>")) {
+      const char *vend = strstr(v, "</variant>");
+      if (vend == NULL || vend > end) break;
+      if (XmlText(v, vend, "name", name, sizeof(name)) &&
+          !strcmp(name, variant)) {
+        return XmlText(v, vend, "description", out, size);
+      }
+    }
+    return 0;
+  }
+  return 0;
+}
+
+/*! \brief Group names from the system's XKB configuration, mapped to
+ * xkeyboard-config's names. \return 1 if there is one for every group. */
+static int ConfiguredGroupNames(int groups) {
+  char layouts[4][XC_ATOM_NAME], variants[4][XC_ATOM_NAME], source[512] = "";
+  int n = ConfiguredLayouts(layouts, variants, 4, source, sizeof(source));
+  if (n == 0) {
+    Log("No XKB layout is configured for the system (xorg.conf.d, "
+        "kbd-model-map); guessing the layout names from the console keymap");
+    return 0;
+  }
+  if (n != groups) {
+    Log("%s gives %d XKB layouts for a console keymap with %d; guessing the "
+        "layout names from the console keymap", source, n, groups);
+    return 0;
+  }
+  char *xml = ReadFile("/usr/share/X11/xkb/rules/evdev.xml");
+  if (xml == NULL) {
+    LogErrno("Reading /usr/share/X11/xkb/rules/evdev.xml");
+    return 0;
+  }
+  char names[2][XC_ATOM_NAME];
+  int ok = 1;
+  for (int i = 0; i < groups && i < 2 && ok; ++i) {
+    ok = LayoutDescription(xml, layouts[i], variants[i], names[i],
+                           XC_ATOM_NAME);
+    if (!ok) {
+      Log("xkeyboard-config has no layout %s(%s) of %s; guessing the layout "
+          "names from the console keymap", layouts[i], variants[i], source);
+    }
+  }
+  free(xml);
+  if (!ok) return 0;
+  XcLock();
+  for (int i = 0; i < groups && i < 2; ++i) {
+    memcpy(xc.shm->group_names[i], names[i], XC_ATOM_NAME);
+  }
+  XcUnlock();
+  return 1;
+}
 
 //! The XKB name of the layout typed in keymap table t.
 static void GroupName(int t, char *out, size_t size) {
@@ -379,6 +586,8 @@ int XcKeyboardInit(int vt_fd, int orig_fd) {
   GroupName(0, xc.shm->group_names[0], XC_ATOM_NAME);
   GroupName(altgr, xc.shm->group_names[1], XC_ATOM_NAME);
   XcUnlock();
+  // Names from the system's XKB configuration replace the guessed ones.
+  ConfiguredGroupNames(groups);
   return 1;
 }
 
@@ -451,59 +660,71 @@ static void DeadKey(unsigned int value, char *text, size_t *len) {
   diacr = diacr ? HandleDiacr(value, text, len) : value;
 }
 
-static KeySym CharKeysym(const char *text, size_t len) {
-  // Decode the (single) character; Latin-1 keysyms equal the code point.
-  unsigned int c = (unsigned char)text[0];
-  if (c >= 0xc0 && len >= 2) {
-    if (c < 0xe0) {
-      c = ((c & 0x1f) << 6) | (text[1] & 0x3f);
-    } else if (c < 0xf0 && len >= 3) {
-      c = ((c & 0x0f) << 12) | ((text[1] & 0x3f) << 6) | (text[2] & 0x3f);
+static long long NowMs(void) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static int KeyDown(unsigned int keycode) {
+  return (key_down[keycode / 8] >> (keycode % 8)) & 1;
+}
+
+/*! \brief The X modifier state: the modifiers of the keys held (X's
+ * modifier map; lock keys excluded, their state is the console's LEDs),
+ * the console's locks and latches, and the group (XkbBuildCoreState). */
+static unsigned int XState(void) {
+  unsigned int state = 0;
+  for (unsigned int k = 0; k < NKEYS; ++k) {
+    if (xc_key_modmap[k] && KeyDown(k)) {
+      state |= xc_key_modmap[k] & ~(unsigned int)(LockMask | Mod2Mask);
     }
   }
-  if (c < 0x20) return c + 0x60;  // Control characters: their letter.
-  if (c < 0x100) return c;
-  return 0x01000000 | c;
+  if (xc.shm->leds & LED_CAP) state |= LockMask;
+  if (xc.shm->leds & LED_NUM) state |= Mod2Mask;
+  state |= KgMods(xc.shm->locks & ~(1u << KG_ALTGR));
+  state |= KgMods(xc.shm->latches);
+  state |= (unsigned int)(xc.shm->group & 3) << 13;
+  return state;
 }
 
 /*! \brief One key event: update the keyboard state like the kernel does,
- * and queue the X event. */
-static void KeyEvent(Display *dpy, unsigned int keycode, int down) {
-  if (keycode >= NKEYS) return;
-  int rep = down && (key_down[keycode / 8] & (1 << (keycode % 8)));
+ * and queue the X event.
+ *
+ * The kernel's own key repeats are dropped: X repeats keys itself (see
+ * XcKeyboardTick), and a client that does not ask for detectable
+ * autorepeat (xsecurelock does not) gets a KeyRelease and a KeyPress per
+ * repeat. synthetic marks those. */
+static void KeyEvent(Display *dpy, unsigned int keycode, int down,
+                     int synthetic) {
+  if (keycode >= NKEYS || keycode > MAX_EVDEV_KEYCODE) return;
+  int rep = down && KeyDown(keycode);
+  if (rep && !synthetic) return;  // the kernel's autorepeat
+  if (!synthetic) {
+    if (down && xc_key_repeats[keycode]) {
+      repeat_key = keycode;
+      repeat_next_ms = NowMs() + REPEAT_DELAY_MS;
+    } else if (!down && keycode == repeat_key) {
+      repeat_key = 0;
+    }
+  }
+
+  unsigned int state = XState();  // X's state is the one before the event
   if (down) {
     key_down[keycode / 8] |= 1 << (keycode % 8);
   } else {
     key_down[keycode / 8] &= ~(1 << (keycode % 8));
   }
 
-  unsigned int state = 0;  // X modifier state before this event
-  if (shift_state & (1 << KG_SHIFT)) state |= ShiftMask;
-  if (xc.shm->leds & LED_CAP) state |= LockMask;
-  if (shift_state & ((1 << KG_CTRL) | (1 << KG_CTRLL) | (1 << KG_CTRLR))) {
-    state |= ControlMask;
-  }
-  if (shift_state & (1 << KG_ALT)) state |= Mod1Mask;
-  if (xc.shm->leds & LED_NUM) state |= Mod2Mask;
-  if (super_down) state |= Mod4Mask;
-  state |= (unsigned int)(xc.shm->group & 3) << 13;  // XkbBuildCoreState
-
   char text[16];
   size_t len = 0;
   KeySym keysym = NoSymbol;
-  const char *named_text = NULL;
-  for (size_t i = 0; i < sizeof(named_keys) / sizeof(named_keys[0]); ++i) {
-    if (named_keys[i].keycode == keycode) {
-      keysym = named_keys[i].keysym;
-      named_text = named_keys[i].text;
-      break;
-    }
-  }
+  const struct XcFixedKey *fixed = FixedKey(keycode);
 
   if (keycode == 125 || keycode == 126) {
-    // The Super keys are X's Mod4; the console keymap may have them bound
-    // to something else (a hotkey daemon's shift), which we do not apply.
-    super_down = down;
+    // The Super keys are X's Mod4 (in the modifier map); the console keymap
+    // may have them bound to something else (a hotkey daemon's shift),
+    // which we do not apply.
   } else {
     // The AltGr lock is the XKB group, which helpers may change.
     lockstate = (lockstate & ~(1u << KG_ALTGR)) |
@@ -512,6 +733,22 @@ static void KeyEvent(Display *dpy, unsigned int keycode, int down) {
     unsigned short sym = K_HOLE;
     if (shift_final < NMAPS && have_map[shift_final]) {
       sym = keymaps[shift_final][keycode];
+    }
+    // The keysym is the character the key types without Control and Alt,
+    // as X's keysym does not depend on them.
+    unsigned int plain = shift_final & ~((1u << KG_CTRL) | (1u << KG_ALT) |
+                                         (1u << KG_CTRLL) | (1u << KG_CTRLR));
+    unsigned short plain_sym = K_HOLE;
+    if (plain < NMAPS && have_map[plain]) plain_sym = keymaps[plain][keycode];
+    if (plain_sym >= 0xf000) {
+      keysym = UnicodeKeysym(plain_sym ^ 0xf000);
+    } else if ((plain_sym >> 8) == KT_LATIN || (plain_sym >> 8) == KT_LETTER) {
+      unsigned int v = plain_sym & 0xff;
+      if ((plain_sym >> 8) == KT_LETTER && (xc.shm->leds & LED_CAP)) {
+        unsigned int t = plain ^ (1 << KG_SHIFT);
+        if (t < NMAPS && have_map[t]) v = keymaps[t][keycode] & 0xff;
+      }
+      if (v >= 0x20) keysym = UnicodeKeysym(v);
     }
     if (sym >= 0xf000) {
       // Unicode keysym: a character.
@@ -532,14 +769,6 @@ static void KeyEvent(Display *dpy, unsigned int keycode, int down) {
         case KT_META:
           // As X: Alt+key types the key's character.
           if (down) EmitChar(value, text, &len);
-          break;
-        case KT_PAD:
-          if (down && (xc.shm->leds & LED_NUM)) {
-            static const char pad_chars[] = "0123456789+-*/\r,.?()#";
-            if (value < sizeof(pad_chars) - 1) {
-              EmitChar((unsigned char)pad_chars[value], text, &len);
-            }
-          }
           break;
         case KT_DEAD:
           if (down) {
@@ -604,22 +833,23 @@ static void KeyEvent(Display *dpy, unsigned int keycode, int down) {
           }
           break;
         default:
-          // KT_FN, KT_CUR, KT_CONS, KT_ASCII, KT_BRL: no characters.
+          // KT_PAD (the keypad is a fixed key), KT_FN, KT_CUR, KT_CONS,
+          // KT_ASCII, KT_BRL: no characters here.
           break;
       }
       if (type != KT_SLOCK && down) slockstate = 0;
+      XcLock();
+      xc.shm->latches = slockstate;
+      XcUnlock();
     }
   }
 
-  if (named_text != NULL) {
-    // X's fixed text for these keys, whatever the console keymap says.
-    len = 0;
-    if (down) {
-      len = strlen(named_text);
-      memcpy(text, named_text, len);
-    }
+  if (fixed != NULL) {
+    // A key whose keysyms do not depend on the layout: X's keysym for the
+    // level the state selects, and X's text for it.
+    keysym = FixedKeysym(fixed, state);
+    len = down ? TranslateKeySym(keysym, state, text) : 0;
   }
-  if (keysym == NoSymbol && len > 0) keysym = CharKeysym(text, len);
 
   XEvent ev;
   memset(&ev, 0, sizeof(ev));
@@ -628,21 +858,24 @@ static void KeyEvent(Display *dpy, unsigned int keycode, int down) {
   ev.xkey.display = dpy;
   ev.xkey.window = XC_ROOT_WINDOW;
   ev.xkey.root = XC_ROOT_WINDOW;
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  ev.xkey.time = (Time)(tv.tv_sec * 1000 + tv.tv_usec / 1000);
+  ev.xkey.time = (Time)NowMs();
   ev.xkey.state = state;
   ev.xkey.keycode = keycode + 8;  // X keycodes are evdev + 8.
   ev.xkey.same_screen = True;
-  size_t slot = ev.xkey.serial % TEXT_RING;
-  text_ring[slot].serial = ev.xkey.serial;
-  text_ring[slot].keysym = keysym;
-  memcpy(text_ring[slot].text, text, len);
-  text_ring[slot].text[len] = 0;
-  XcQueueEvent(&ev);
+  XcKeyText key;
+  memset(&key, 0, sizeof(key));
+  key.keysym = keysym;
+  memcpy(key.text, text, len);
+  XcQueueKeyEvent(&ev, &key);
 }
 
 void XcKeyboardInput(Display *dpy, const unsigned char *buf, size_t len) {
+  static unsigned long total;
+  if (getenv("XSECURELOCK_DEBUG_CONSOLE_KEYS") &&
+      (total + len) / 500 != total / 500) {
+    Log("%lu key events read", total + len);
+  }
+  total += len;
   // K_MEDIUMRAW: one byte per event, keycode | 0x80 on release; keycodes
   // above 127 as 0x00/0x80 followed by two bytes of 7 bits each.
   static unsigned char pending[3];
@@ -652,16 +885,42 @@ void XcKeyboardInput(Display *dpy, const unsigned char *buf, size_t len) {
     if ((pending[0] & 0x7f) == 0) {
       if (npending < 3) continue;
       unsigned int keycode = ((pending[1] & 0x7f) << 7) | (pending[2] & 0x7f);
-      KeyEvent(dpy, keycode, !(pending[0] & 0x80));
+      KeyEvent(dpy, keycode, !(pending[0] & 0x80), 0);
     } else {
-      KeyEvent(dpy, pending[0] & 0x7f, !(pending[0] & 0x80));
+      KeyEvent(dpy, pending[0] & 0x7f, !(pending[0] & 0x80), 0);
     }
     npending = 0;
   }
 }
 
+void XcKeyboardTick(Display *dpy) {
+  if (repeat_key == 0) return;
+  long long now = NowMs();
+  if (now - repeat_next_ms > 1000) repeat_next_ms = now;  // we were stopped
+  while (repeat_key != 0 && now >= repeat_next_ms) {
+    if (getenv("XSECURELOCK_DEBUG_CONSOLE_KEYS")) {
+      Log("repeat of key %u", repeat_key);
+    }
+    KeyEvent(dpy, repeat_key, 0, 1);
+    KeyEvent(dpy, repeat_key, 1, 1);
+    repeat_next_ms += REPEAT_INTERVAL_MS;
+  }
+}
+
+int XcKeyboardTimeoutMs(void) {
+  if (repeat_key == 0) return -1;
+  long long d = repeat_next_ms - NowMs();
+  return d < 0 ? 0 : (int)d;
+}
+
 // ---------------------------------------------------------------------------
 // Xlib key lookup.
+
+void XcKeyDequeued(unsigned long serial, const XcKeyText *key) {
+  size_t slot = serial % TEXT_RING;
+  text_ring[slot].serial = serial;
+  text_ring[slot].key = *key;
+}
 
 static int LookupText(const XKeyEvent *ev, char *buf, int nbytes,
                       KeySym *keysym) {
@@ -670,11 +929,11 @@ static int LookupText(const XKeyEvent *ev, char *buf, int nbytes,
     if (keysym) *keysym = NoSymbol;
     return 0;
   }
-  if (keysym) *keysym = text_ring[slot].keysym;
+  if (keysym) *keysym = text_ring[slot].key.keysym;
   if (ev->type != KeyPress) return 0;
-  int n = (int)strlen(text_ring[slot].text);
+  int n = (int)strnlen(text_ring[slot].key.text, sizeof(text_ring[slot].key.text));
   if (n > nbytes) n = nbytes;
-  memcpy(buf, text_ring[slot].text, (size_t)n);
+  memcpy(buf, text_ring[slot].key.text, (size_t)n);
   return n;
 }
 
@@ -696,19 +955,26 @@ int XmbLookupString(XIC ic, XKeyPressedEvent *event, char *buffer, int nbytes,
   return n;
 }
 
+/*! \brief libX11's XKeysymToString: the keysym's name (keysymdef.h,
+ * XF86keysym.h), "U%04lX"/"U%06lX" for other Unicode keysyms, else NULL. */
 char *XKeysymToString(KeySym keysym) {
-  for (size_t i = 0; i < sizeof(keysym_names) / sizeof(keysym_names[0]);
-       ++i) {
-    if (keysym_names[i].keysym == keysym) return (char *)keysym_names[i].name;
+  size_t lo = 0, hi = sizeof(xc_keysym_names) / sizeof(xc_keysym_names[0]);
+  while (lo < hi) {
+    size_t mid = (lo + hi) / 2;
+    if (xc_keysym_names[mid].value < keysym) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
   }
-  static char buf[16];
-  if (keysym >= 0x20 && keysym < 0x7f) {
-    buf[0] = (char)keysym;
-    buf[1] = 0;
-    return buf;
+  if (lo < sizeof(xc_keysym_names) / sizeof(xc_keysym_names[0]) &&
+      xc_keysym_names[lo].value == keysym) {
+    return (char *)xc_keysym_names[lo].name;
   }
   if ((keysym & 0xff000000) == 0x01000000) {
-    snprintf(buf, sizeof(buf), "U%04lX", keysym & 0xffffff);
+    static char buf[16];
+    unsigned long val = keysym & 0xffffff;
+    snprintf(buf, sizeof(buf), (val & 0xff0000) ? "U%06lX" : "U%04lX", val);
     return buf;
   }
   return NULL;
@@ -784,11 +1050,13 @@ Status XkbGetState(Display *dpy, unsigned int device, XkbStatePtr state) {
   state->group = state->locked_group = (unsigned char)xc.shm->group;
   unsigned int leds = xc.shm->leds;
   unsigned int locks = xc.shm->locks;
+  unsigned int latches = xc.shm->latches;
   XcUnlock();
   if (leds & LED_CAP) state->locked_mods |= LockMask;
   if (leds & LED_NUM) state->locked_mods |= Mod2Mask;
-  if (locks & (1u << KG_SHIFT)) state->locked_mods |= ShiftMask;
-  state->mods = state->locked_mods;
+  state->locked_mods |= KgMods(locks & ~(1u << KG_ALTGR));
+  state->latched_mods = KgMods(latches);
+  state->mods = state->locked_mods | state->latched_mods;
   return Success;
 }
 

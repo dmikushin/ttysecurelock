@@ -53,6 +53,11 @@ AC_ARG_ENABLE([console],
               [enable_console=$enableval],
               [enable_console=no])
 AM_CONDITIONAL([CONSOLE], [test x$enable_console = xyes])
+dnl The helpers: xsecurelock's in $(pkglibexecdir); ttysecurelock's apart.
+AS_IF([test x$enable_console = xyes],
+      [helpersdir='${libexecdir}/ttysecurelock'],
+      [helpersdir='${pkglibexecdir}'])
+AC_SUBST([helpersdir])
 
 AC_CHECK_HEADER(X11/Xlib.h,
                 [], [AC_MSG_ERROR(X includes not found.)])

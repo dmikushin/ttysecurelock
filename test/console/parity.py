@@ -51,11 +51,15 @@ XKB = [["-layout", "us,ru", "-option", "", "-option", "grp:caps_toggle",
 
 # evdev keycodes
 ESC, BS, TAB, ENTER, CTRL, SHIFT, CAPS, NUM = 1, 14, 15, 28, 29, 42, 58, 69
+# Keys without text whose X keysym names XSECURELOCK_KEY_<name>_COMMAND
+# uses (none of them powers off, suspends or switches anything).
+NAMED = {140: "XF86Calculator", 155: "XF86Mail", 150: "XF86WWW",
+         148: "XF86Launch1", 63: "F5", 119: "Pause"}
 KEY = {c: k for c, k in zip("qwertyuiop", range(16, 26))}
 KEY.update({c: k for c, k in zip("asdfghjkl", range(30, 39))})
 KEY.update({c: k for c, k in zip("zxcvbnm", range(44, 51))})
 KEY.update({str(d % 10): 1 + d for d in range(1, 11)})
-ALL_KEYS = sorted(set(KEY.values()) | {ESC, BS, TAB, ENTER, CTRL, SHIFT, CAPS,
+ALL_KEYS = sorted(set(KEY.values()) | set(NAMED) | {ESC, BS, TAB, ENTER, CTRL, SHIFT, CAPS,
                                        NUM})
 
 BASE_ENV = {
@@ -148,6 +152,59 @@ def scenarios():
                           ("escape", tap(ESC), 4.0),
                           ("wake", tap(SHIFT), 2.0),
                           ("right", password_keys(), 4.0)]})
+    out.append({"name": "autorepeat",
+                "env": {"XSECURELOCK_PASSWORD_PROMPT": "asterisks"},
+                "repeat": True,
+                "steps": [("wake", tap(SHIFT), 2.0),
+                          ("hold a", [(KEY["a"], 1)], 1.5),
+                          ("release a", [(KEY["a"], 0)], 1.0),
+                          ("hold backspace", [(BS, 1)], 1.5),
+                          ("release backspace", [(BS, 0)], 1.0),
+                          ("hold shift", [(SHIFT, 1)], 1.5),
+                          ("release shift", [(SHIFT, 0)], 1.0),
+                          ("password", password_keys(), 4.0)]})
+    keys = []
+    for code in NAMED:
+        keys += tap(code)
+    out.append({"name": "key-commands",
+                "env": {f"XSECURELOCK_KEY_{name}_COMMAND":
+                        f"echo {name} >> $KEYCMD_OUT" for name in
+                        NAMED.values()},
+                "keycmd": True,
+                "steps": [("named keys", keys, 3.0),
+                          ("wake", tap(SHIFT), 2.0),
+                          ("password", password_keys(), 4.0)]})
+    out.append({"name": "locks-and-latches",
+                "env": {"XSECURELOCK_SHOW_LOCKS_AND_LATCHES": "1"},
+                "steps": [("a", tap(KEY["a"])),
+                          ("shift+caps: caps lock on", chord(SHIFT, CAPS)),
+                          ("num lock on", tap(NUM)),
+                          ("caps: russian", tap(CAPS)),
+                          ("caps: latin", tap(CAPS)),
+                          ("num lock off", tap(NUM)),
+                          ("shift+caps: caps lock off", chord(SHIFT, CAPS)),
+                          ("password", password_keys(), 4.0)]})
+    for spec in ("#f00", "#ff0000", "#fff000000", "#ffff00000000",
+                 "rgb:f/0/0", "rgb:ff/0/0", "rgb:ffff/0/0", "RGB:FF/0/0",
+                 "rgbi:1/0/0", "Red", "RED", "red1"):
+        out.append({"name": f"warning-color {spec}",
+                    "env": {"XSECURELOCK_AUTH_WARNING_COLOR": spec},
+                    "steps": [("a", tap(KEY["a"])),
+                              ("caps lock on", chord(SHIFT, CAPS)),
+                              ("caps lock off", chord(SHIFT, CAPS)),
+                              ("password", password_keys(), 4.0)]})
+    # 2000 keys at once: nothing may be lost. 999 x (a, BackSpace), then
+    # "ab" and the rest of the password: it unlocks only if every key came.
+    burst = []
+    for _ in range(999):
+        burst += tap(KEY["a"]) + tap(BS)
+    burst += text("ab")
+    out.append({"name": "burst-2000-keys", "console_only": True,
+                "env": {"XSECURELOCK_PASSWORD_PROMPT": "asterisks"},
+                "steps": [("wake", tap(SHIFT), 2.0),
+                          ("burst", burst, 5.0, "fast"),
+                          ("rest of the password", tap(CAPS) + text("gfhjkm")
+                           + tap(CAPS) + tap(ENTER), 4.0)]})
     out.append({"name": "blink", "env": {"XSECURELOCK_AUTH_CURSOR_BLINK": "1"},
                 "steps": [("a", tap(KEY["a"])), ("wait", [], 3.0),
                           ("password", password_keys(), 4.0)],
@@ -220,13 +277,28 @@ def x_frames(log):
             y, rgb = int(parts[4]), parts[5]
             s = (parts[6] if len(parts) > 6 else "").strip()
             if s:
-                cur[1].append((y, s, rgb == "255,0,0"))
+                # The warning colour: red in every spec the test uses
+                # ("#f00" is (240, 0, 0) under X: libX11 shifts, it does
+                # not scale).
+                r, g, b = map(int, rgb.split(","))
+                cur[1].append((y, s, r >= 200 and g < 64 and b < 64))
     flush()
     return frames
 
 
+def safe(name):
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+
+
+def keycmd_file(outdir, side):
+    path = os.path.join(outdir, f"keycmd-{side}")
+    open(path, "w").close()
+    os.chmod(path, 0o666)
+    return path
+
+
 def run_x(scenario, outdir):
-    log = os.path.join(outdir, f"x-{scenario['name']}.log")
+    log = os.path.join(outdir, f"x-{safe(scenario['name'])}.log")
     open(log, "w").close()
     os.chmod(log, 0o666)
     # A real Xorg on a spare VT: Xvfb (xorg-server 21.1.25) ignores every
@@ -244,6 +316,7 @@ def run_x(scenario, outdir):
         subprocess.run([os.path.join(outdir, "xkey"), f"{CAPS}:1", f"{CAPS}:0"],
                        env=env, check=True)
     env.update(scenario["env"])
+    env["KEYCMD_OUT"] = keycmd_file(outdir, "x")
     env.update(HOME="/tmp", USER=USER, LOGNAME=USER, XSHIM_LOG=log,
                LD_PRELOAD=f"{outdir}/xshim.so {outdir}/randshim.so")
     os.chmod(outdir, 0o755)
@@ -252,7 +325,7 @@ def run_x(scenario, outdir):
                              XSECURELOCK],
                             stderr=open(log + ".stderr", "w"))
     time.sleep(1.5)
-    steps = play(scenario, lambda evs: subprocess.run(
+    steps = play(scenario, lambda evs, fast=False: subprocess.run(
         [os.path.join(outdir, "xkey"), *[f"{c}:{d}" for c, d in evs]],
         env=dict(BASE_ENV, DISPLAY=XDISPLAY), check=True))
     try:
@@ -264,7 +337,8 @@ def run_x(scenario, outdir):
     xvfb.wait()
     chvt(VT)
     frames = x_frames(log) if os.path.exists(log) else []
-    return {"frames": frames, "steps": steps, "exit": rc}
+    return {"frames": frames, "steps": steps, "exit": rc,
+            "keycmd": open(os.path.join(outdir, "keycmd-x")).read().split()}
 
 
 def play(scenario, send):
@@ -277,7 +351,7 @@ def play(scenario, send):
         if len(step) > 3 and step[3] == "reset":
             faillock_reset()
         if events:
-            send(events)
+            send(events, fast=len(step) > 3 and step[3] == "fast")
         sent = int(time.time() * 1000)
         time.sleep(wait)
         out.append((name, start, int(time.time() * 1000), sent))
@@ -308,11 +382,12 @@ def uinput_keyboard():
     return fd
 
 
-def emit(fd, events):
+def emit(fd, events, delay=0.02):
     for code, down in events:
         os.write(fd, EVENT.pack(0, 0, EV_KEY, code, down))
         os.write(fd, EVENT.pack(0, 0, EV_SYN, 0, 0))
-        time.sleep(0.02)
+        if delay:
+            time.sleep(delay)
 
 
 def altgr_lock():
@@ -448,7 +523,9 @@ def run_console(scenario, outdir, kb):
     env.update(scenario["env"])
     env["LD_PRELOAD"] = f"{outdir}/randshim.so"
     env["XSECURELOCK_DEBUG_CONSOLE_LAYOUT"] = "1"
-    log = os.path.join(outdir, f"console-{scenario['name']}.stderr")
+    env["XSECURELOCK_DEBUG_CONSOLE_KEYS"] = "1"
+    env["KEYCMD_OUT"] = keycmd_file(outdir, "console")
+    log = os.path.join(outdir, f"console-{safe(scenario['name'])}.stderr")
     proc = subprocess.Popen(["env", "-i",
                              *[f"{k}={v}" for k, v in env.items()],
                              TTYSECURELOCK, "--user", USER],
@@ -464,7 +541,8 @@ def run_console(scenario, outdir, kb):
     poller = Poller(lock_vt)
     poller.start()
     time.sleep(1.5)
-    steps = play(scenario, lambda evs: emit(kb, evs))
+    steps = play(scenario, lambda evs, fast=False: emit(kb, evs,
+                                                         0 if fast else 0.02))
     try:
         rc = proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
@@ -494,6 +572,8 @@ def run_console(scenario, outdir, kb):
             os.close(fd)
             chvt(VT)
     return {"frames": poller.frames, "steps": steps, "exit": rc,
+            "keycmd": open(os.path.join(outdir,
+                                        "keycmd-console")).read().split(),
             "back_to_vt": back, "lock_vt": lock_vt, "lock_vt_freed": freed,
             "initial_group": initial}
 
@@ -508,6 +588,19 @@ def at(frames, t):
     return f
 
 
+def repeat_tolerant(xf, cf):
+    """Asterisk counts within 2 of each other count as equal."""
+    def stars(f):
+        return [len(t) - 1 if re.fullmatch(r"\*+_?", t) else None
+                for t, _ in f]
+    if len(xf) == len(cf):
+        xs, cs = stars(xf), stars(cf)
+        if all(a == b or (a is not None and b is not None and abs(a - b) <= 2)
+               for a, b in zip(xs, cs)):
+            return xf, xf
+    return xf, cf
+
+
 def reaction(frames, sent, end, prev):
     """The frames once the step's keys were all sent, the one showing at
     that moment first unless it is still the previous step's last frame
@@ -520,10 +613,25 @@ def reaction(frames, sent, end, prev):
     return out
 
 
+def console_only(c):
+    problems = []
+    if c["exit"] != 0:
+        problems.append(f"ttysecurelock exit {c['exit']}")
+    if c.get("back_to_vt") != VT:
+        problems.append(f"back on VT {c.get('back_to_vt')}, not {VT}")
+    return problems, [], [], [f for _, f in c["frames"]]
+
+
 def compare(scenario, x, c):
     problems = []
     if "error" in c:
         return [c["error"]]
+    if x is None:
+        return console_only(c)
+    if scenario.get("keycmd"):
+        if x["keycmd"] != c["keycmd"] or not x["keycmd"]:
+            problems.append(f"key commands: X {x['keycmd']} != console "
+                            f"{c['keycmd']}")
     xn = [(t, normalize(f, scenario)) for t, f in x["frames"]]
     cn = [(t, normalize(f, scenario)) for t, f in c["frames"]]
     xs = [f for _, f in dedup(xn)]
@@ -543,6 +651,11 @@ def compare(scenario, x, c):
         prev_x, prev_c = xf, cf
         if scenario.get("blink"):
             xr, cr = sorted(set(map(str, xr))), sorted(set(map(str, cr)))
+        if scenario.get("repeat"):
+            # Repeats are timed: the count may differ by a repeat or two
+            # (40 ms each) between two runs. Compare it within 2.
+            xf, cf = repeat_tolerant(xf, cf)
+            xr = cr = []
         ok = xf == cf and xr == cr
         report.append({"step": name, "ok": ok, "x": xf, "console": cf,
                        "x_reaction": xr, "console_reaction": cr})
@@ -597,7 +710,7 @@ def main():
             if args.only and sc["name"] not in args.only:
                 continue
             faillock_reset()
-            x = run_x(sc, args.out)
+            x = None if sc.get("console_only") else run_x(sc, args.out)
             faillock_reset()
             c = run_console(sc, args.out, kb)
             faillock_reset()

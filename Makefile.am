@@ -15,7 +15,7 @@
 CLEANFILES =
 
 macros = \
-	-DHELPER_PATH=\"$(pkglibexecdir)\" \
+	-DHELPER_PATH=\"$(helpersdir)\" \
 	-DDOCS_PATH=\"$(docdir)\" \
 	-DAUTH_EXECUTABLE=\"@auth_executable@\" \
 	-DAUTHPROTO_EXECUTABLE=\"@authproto_executable@\" \
@@ -63,15 +63,16 @@ endif
 if CONSOLE
 # The installed program is ttysecurelock (xconsole/entry.c, which calls
 # xsecurelock's main renamed to xsecurelock_main); its helpers live apart
-# from an X xsecurelock's.
-pkglibexecdir = $(libexecdir)/ttysecurelock
+# from an X xsecurelock's (helpersdir, set by configure).
 noinst_LIBRARIES = libxconsole.a
 libxconsole_a_SOURCES = \
 	xconsole/display.c \
 	xconsole/entry.c \
 	xconsole/keyboard.c \
 	xconsole/vt.c \
-	xconsole/xconsole_internal.h
+	xconsole/xcolors.inc \
+	xconsole/xconsole_internal.h \
+	xconsole/xkeys.inc
 libxconsole_a_CPPFLAGS = -D_GNU_SOURCE
 xlibs = libxconsole.a -lpthread
 main_rename = -Dmain=xsecurelock_main
@@ -101,7 +102,7 @@ nodist_xsecurelock_SOURCES = \
 xsecurelock_CPPFLAGS = $(macros) $(LIBBSD_CFLAGS) $(main_rename)
 xsecurelock_LDADD = $(LIBBSD_LIBS) $(xlibs)
 
-helpersdir = $(pkglibexecdir)
+helpersdir = @helpersdir@
 helpers_SCRIPTS = \
 	helpers/saver_blank
 if HAVE_HTPASSWD
@@ -262,9 +263,10 @@ version.c: FORCE
 		echo "const char *const git_version = \"` \
 			git describe --always --dirty \
 		`\";" > version.c; \
-	else \
-		: version.c must exist in non-git builds.; \
+	elif [ -f version.c ]; then \
 		cat version.c; \
+	else \
+		echo "const char *const git_version = \"\";" > version.c; \
 	fi
 .PRECIOUS: version.c  # Old one is better than none.
 

@@ -18,7 +18,41 @@ installs `/usr/local/bin/ttysecurelock` and the helpers in
 Run (as root; normally the hotkey daemon tty-i3-keys does it on Win+Escape):
 `ttysecurelock --user NAME [xsecurelock arguments]`. NAME must own the VT in
 front; the lock refuses otherwise. The settings are xsecurelock's
-`XSECURELOCK_*` environment variables, with the same defaults.
+`XSECURELOCK_*` environment variables, read by xsecurelock's own code with
+its defaults; see "Configuration" below for what each one does here.
+
+## Configuration
+
+Honoured as under X (the code reading them is upstream's):
+`XSECURELOCK_AUTH`, `_AUTHPROTO`, `_AUTH_CURSOR_BLINK`, `_AUTH_TIMEOUT`,
+`_BLANK_TIMEOUT` (blanks the console), `_DATETIME_FORMAT`,
+`_DEBUG_ALLOW_LOCKING_IF_INEFFECTIVE`, `_DISCARD_FIRST_KEYPRESS` (by default
+the key that wakes the prompt is not typed, as under X), `_FORCE_GRAB` (the
+grab cannot fail on the console), `_GLOBAL_SAVER`, `_KEY_<keysym>_COMMAND`
+(X's keysym names, see "Keys"), `_NO_PAM_RHOST`, `_PAM_SERVICE`,
+`_PASSWORD_PROMPT` (all nine modes), `_SAVER_DELAY_MS`,
+`_SAVER_RESET_ON_AUTH_CLOSE`, `_SAVER_STOP_ON_BLANK`, `_SHOW_DATETIME`,
+`_SHOW_HOSTNAME`, `_SHOW_KEYBOARD_LAYOUT`, `_SHOW_LOCKS_AND_LATCHES`,
+`_SHOW_USERNAME`, `_SINGLE_AUTH_WINDOW`, `_SWITCH_USER_COMMAND`,
+`_WAIT_TIME_MS`.
+
+Honoured, reduced by the console: `_BACKGROUND_COLOR`,
+`_AUTH_BACKGROUND_COLOR`, `_AUTH_FOREGROUND_COLOR`, `_AUTH_WARNING_COLOR`
+(parsed as XAllocNamedColor does, then the nearest of the console's 16
+colours; see "Colours"), `_AUTH_SOUNDS` (the PC speaker tone),
+`_BURNIN_MITIGATION` and `_BURNIN_MITIGATION_DYNAMIC` (offsets in pixels move
+the prompt by whole cells), `_SAVER` (`saver_blank` works; a saver that draws
+cannot: there is no X for it), `_DEBUG_WINDOW_INFO` (calls xwininfo/xprop,
+which find no X).
+
+No effect, their X feature does not exist on the console (compiled out):
+`_BLANK_DPMS_STATE` (no DPMS), `_COMPOSITE_OBSCURER`, `_NO_COMPOSITE`
+(XComposite), `_NO_XRANDR`, `_NO_XRANDR15` (XRandR), `_DIM_ALPHA`,
+`_DIM_COLOR`, `_DIM_FPS`, `_DIM_MAX_FILL_SIZE`,
+`_DIM_OVERRIDE_COMPOSITOR_DETECTION`, `_DIM_TIME_MS` (dimmer), `_IDLE_TIMERS`
+(until_nonidle: XScreenSaver/XSync idle timers), `_IMAGE_DURATION_SECONDS`,
+`_LIST_VIDEOS_COMMAND`, `_VIDEOS_FLAGS` (saver_mpv), `_XSCREENSAVER_PATH`
+(saver_xscreensaver), `_FONT` (Xft/core fonts: the console font is used).
 
 ## The seam
 
@@ -33,12 +67,12 @@ edit). Everything else happens behind the Xlib calls:
 | `XGrabKeyboard` | Brings the lock VT to the front (repeated until it really is), keyboard in `K_MEDIUMRAW`, `VT_LOCKSWITCH`. |
 | `XGrabPointer`, `XGrabServer`, `XUngrabServer`, `XSetInputFocus`, `XGetInputFocus`, cursors, pixmaps, `XUndefineCursor` | No pointer, no other clients: succeed, do nothing. `XQueryPointer` reports the top left corner. |
 | `XCreateWindow`, `XDestroyWindow`, `XMapWindow`, `XMapRaised`, `XUnmapWindow`, `XRaiseWindow`, `XRestackWindows`, `XConfigureWindow`, `XMoveResizeWindow`, `XChangeWindowAttributes`, `XGetWindowAttributes`, `XQueryTree`, `XClearWindow` | A window table shared by all processes of the lock; windows stack and clip as in X and are painted as console cells. Coordinates are pixels of a screen of console-font cells, so xsecurelock's pixel arithmetic keeps its meaning. Windows of processes that are gone are destroyed, as X destroys a disconnected client's windows. |
-| `XSelectInput`, `XPending`, `XNextEvent`, `XFilterEvent`, `XFlush` | Events of the main program: key events read from the lock VT, Map/Unmap/Visibility/ConfigureNotify of its own windows, root ConfigureNotify when the console is resized. |
-| `XLookupString`, `XmbLookupString`, `XKeysymToString` | The characters the console itself would type: the keycode is translated with the kernel keymap (read with `KDGKBENT` through a VT in `K_UNICODE` mode), following the kernel's `kbd_keycode()`/`k_*` handlers (shift/AltGr/Ctrl/Alt maps, shift and AltGr locks, Caps Lock on letters, dead keys and the accent table, keypad with Num Lock). Keys X maps to fixed keysyms whatever the layout (Return, BackSpace, Tab, Escape, Delete, cursor, function, modifier and media keys) get those keysyms and texts. |
-| `XkbQueryExtension`, `XkbGetMap`, `XkbGetControls`, `XkbGetNames`, `XkbGetState`, `XkbGetIndicatorState`, `XkbLockGroup`, `XkbFreeKeyboard` | The XKB view of the console keyboard. Groups: 2 if the keymap has an AltGr lock (ruwin_cplk: CapsLock), named as X names the layouts from the letters the tables type ("English (US)", "Russian", ...). Group = the AltGr lock. Indicators: the 14 of an X server with the evdev rules, in its order ("Caps Lock", "Num Lock", "Scroll Lock", ..., "Shift Lock", "Group 2", "Mouse Keys"); lit from the console LED flags, the shift lock and the group. `XkbLockGroup` (auth_x11's Ctrl-Tab) sets the group. At lock time all of it is taken from the VT in front: its LED flags with `KDGKBLED`, its AltGr lock through the kernel's `kbd-altgrlock` LED trigger on a key-less uinput LED (there is no ioctl for a VT's lock state). The kernel publishes there the lock state of the console that received the last key (`kbd` in drivers/tty/vt/keyboard.c); for a lock started by a hotkey pressed on the user's VT, that is the VT in front. |
-| `XAllocNamedColor`, `XQueryColor`, `XFreeColors`, `XCreateGC`, `XFreeGC` | Colours are the console's 16 (palette read with `GIO_CMAP`); a named colour (`#rrggbb`, `#rgb`, X names, `/usr/share/X11/rgb.txt`) gets the nearest one. |
+| `XSelectInput`, `XPending`, `XNextEvent`, `XFilterEvent`, `XFlush` | Events of the main program: key events read from the lock VT (all that is there, into a queue that grows: nothing is dropped), X's autorepeat, Map/Unmap/Visibility/ConfigureNotify of its own windows, root ConfigureNotify when the console is resized. See "Events". |
+| `XLookupString`, `XmbLookupString`, `XKeysymToString` | See "Keys". |
+| `XkbQueryExtension`, `XkbGetMap`, `XkbGetControls`, `XkbGetNames`, `XkbGetState`, `XkbGetIndicatorState`, `XkbLockGroup`, `XkbFreeKeyboard` | The XKB view of the console keyboard. Groups: 2 if the keymap has an AltGr lock (ruwin_cplk: CapsLock). Their names are xkeyboard-config's (rules/evdev.xml) for the system's XKB layouts: XkbLayout/XkbVariant in /etc/X11/xorg.conf.d, else the X layout systemd's kbd-model-map gives the KEYMAP of /etc/vconsole.conf, taken in order when there are as many as groups. Without such a configuration (corentin, yoga3, 3a5000: the layouts come from the user's setxkbmap, which the console cannot see) they are guessed from the letters each table types ("English (US)", "Russian", "Ukrainian", "Belarusian"; any other Latin layout shows as "English (US)") and the lock logs that it guessed. Group = the AltGr lock. Indicators: the 14 of an X server with the evdev rules, in its order ("Caps Lock", "Num Lock", "Scroll Lock", ..., "Shift Lock", "Group 2", "Mouse Keys"); lit from the console LED flags, the shift lock and the group. `XkbGetState`: locked modifiers from the LEDs (Lock, Mod2) and the console's locks (Shift, Control, Mod1, Mod5 for its Shift/Ctrl/Alt/AltGr locks; the AltGr lock is the group here), latched modifiers from its sticky shifts (`KT_SLOCK`), as XSECURELOCK_SHOW_LOCKS_AND_LATCHES shows them. `XkbLockGroup` (auth_x11's Ctrl-Tab) sets the group. At lock time all of it is taken from the VT in front: its LED flags with `KDGKBLED`, its AltGr lock through the kernel's `kbd-altgrlock` LED trigger on a key-less uinput LED (there is no ioctl for a VT's lock state). The kernel publishes there the lock state of the console that received the last key (`kbd` in drivers/tty/vt/keyboard.c); for a lock started by a hotkey pressed on the user's VT, that is the VT in front. |
+| `XAllocNamedColor`, `XQueryColor`, `XFreeColors`, `XCreateGC`, `XFreeGC` | See "Colours". |
 | `XLoadQueryFont`, `XTextWidth`, `XDrawString` | The console font as a core font one cell wide; its height is a cell minus auth_x11's line spacing, so its lines are one row apart. Text is UTF-8, written to the cells under it where no window above covers them; a character takes the cells the console gives it (2 for double-width ones, 0 for combining marks). |
-| `XInternAtom`, `XGetAtomName`, `XChangeProperty`, `XSetWMProperties`, `XStringListToTextProperty`, `XAllocClassHint`, `XGetClassHint`, `XmuClientWindow`, `XFree` | Atoms in the shared table; window manager properties are accepted and ignored (there is no window manager). |
+| `XInternAtom` (with `only_if_exists`), `XGetAtomName`, `XChangeProperty`, `XSetWMProperties`, `XStringListToTextProperty`, `XAllocClassHint`, `XGetClassHint`, `XmuClientWindow`, `XFree` | Atoms in the shared table; window manager properties are accepted and ignored (there is no window manager). |
 | `XForceScreenSaver` | Blanks/unblanks the console (`TIOCL_BLANKSCREEN`). |
 | `XBell`, `XGetKeyboardControl`, `XChangeKeyboardControl` | `KDMKTONE` with the bell pitch and duration (XSECURELOCK_AUTH_SOUNDS). |
 | `XSetErrorHandler`, `XGetErrorText`, `XOpenIM`, `XCreateIC` | Trivial. |
@@ -48,11 +82,16 @@ edit). Everything else happens behind the Xlib calls:
 `configure.ac`: `--enable-console`; with it libX11/Xmu are not required, XKB
 is "available" (xconsole provides it), every other X extension (XComposite,
 XRandR, XScreenSaver, XSync, XF86Misc, DPMS, Xft, fontconfig) and the savers
-that need X (mplayer, mpv, xscreensaver) are off. `Makefile.am`: builds
-`libxconsole.a` and links the programs against it, renames upstream `main`,
-installs the program as `ttysecurelock` and the helpers in
-`$(libexecdir)/ttysecurelock`, mode 0711; `dimmer` and the X debugging tools
-are not built.
+that need X (mplayer, mpv, xscreensaver) are off. `Makefile.am`: builds `libxconsole.a` and links the programs against it,
+renames upstream `main`, installs the program as `ttysecurelock` and the
+helpers in `$(libexecdir)/ttysecurelock` (configure's `helpersdir`; upstream's
+two uses of `$(pkglibexecdir)` now say `$(helpersdir)`, which is
+`$(pkglibexecdir)` without `--enable-console`), mode 0711; `dimmer` and the X
+debugging tools are not built. The `version.c` rule writes an empty version
+when there is neither git nor a version.c (a tarball of the tree), instead of
+failing. A clean `git clone` and a `git archive` tree both build with
+`./autogen.sh && ./configure --enable-console ... && make`, without automake
+warnings.
 
 `scripts/fork-check.sh` lists every file changed since upstream (commit
 2cf9729, an unchanged v1.9.0) and fails if one outside `xconsole/`,
@@ -67,16 +106,13 @@ are not built.
   (`XSECURELOCK_BLANK_DPMS_STATE`: the console only blanks), dimmer
   (`XSECURELOCK_DIM_*`), and the X savers (mpv, mplayer, xscreensaver) do not
   exist. `saver_blank` and `saver_multiplex` work.
-- **Fonts.** No Xft/fontconfig: `XSECURELOCK_FONT` is ignored, the console
-  font is used, one cell per character (wide glyphs, emoji and kaomoji the
-  font lacks show as the console's replacement glyph; the screen holds the
-  right code points). Colours are reduced to the console's 16.
+- **Fonts.** No Xft/fontconfig: `XSECURELOCK_FONT` is ignored and the
+  console font is used. Characters take the cells the console gives them: 2
+  for double-width ones (emoji), 0 for combining marks (drawn into the cell
+  before); glyphs the font lacks show as its replacement glyph, the screen
+  holds the right code points. Colours are reduced to the console's 16.
 - **No pointer**: mouse motion and buttons do not wake the prompt; with
   `XSECURELOCK_SINGLE_AUTH_WINDOW` the window is on the only screen anyway.
-- **Keysyms.** Characters outside Latin-1 get Unicode keysyms
-  (`0x1000000 + code point`), not X's legacy ones (e.g. `Cyrillic_a`):
-  this matters only for `XSECURELOCK_KEY_<name>_COMMAND` with such names.
-  Ctrl-Tab, Ctrl-Backspace, Ctrl-Alt-O/Win-O and the fixed keys are the same.
 - **The layout after unlock.** Under X the layout chosen at the prompt stays
   after unlocking (XKB state is global). The console's lock state is per VT
   and the kernel offers no way to set another VT's lock state, so the session
@@ -88,6 +124,10 @@ are not built.
   start as root to take and lock a VT, then runs as the user (with
   `CAP_SYS_TTY_CONFIG` only, non-dumpable).
 
+Kernel facilities used and their limits: Magic SysRq is the kernel's (16 =
+sync only on corentin, yoga3, 3a5000), as under X; Ctrl+Alt+Del is handled
+by the kernel/systemd before the keyboard reaches the lock, as under X.
+
 Upstream behaviour kept as it is, including bugs: the first key that wakes the
 prompt is not typed; keys typed while the prompt is closing after Escape are
 lost; the `disco` prompt computes its length as `stride * DANCERS *
@@ -95,11 +135,67 @@ strlen(dancer) + strlen(combiner)` (auth_x11.c) — 1505 bytes for a 258-byte
 buffer — and so writes a NUL past the buffer and draws stack garbage after the
 dancers, under X as well.
 
+## Keys
+
+- **Layout keys** type what the console itself would type: the keycode is
+  translated with the kernel keymap (read with `KDGKBENT` through a VT in
+  `K_UNICODE` mode), following the kernel's `kbd_keycode()`/`k_*` handlers
+  (shift/AltGr/Ctrl/Alt maps, shift and AltGr locks, Caps Lock on letters,
+  dead keys and the accent table). Their keysym is the one X has for that
+  character (keysymdef.h: `Cyrillic_a` for а, Latin-1 as is, else
+  `0x1000000 + code point`), without Control and Alt as in X.
+- **Fixed keys** (Escape, BackSpace, Tab, Return, Delete, cursor, function,
+  keypad, modifier, media and all XF86 keys): the keysyms, key types (levels:
+  Shift, Num Lock for the keypad, Ctrl+Alt on F-keys giving XF86Switch_VT_n,
+  Alt on Print, Ctrl on Pause, ...) and texts are X's, generated by
+  `scripts/gen-xconsole-tables.py` from the keymap Xorg compiles for the
+  user's setxkbmap (`test/console/user-keymap.xkb`, dumped with xkbcomp),
+  the text by libX11's `_XTranslateKeySym`.
+- **Keysym names** (`XKeysymToString`, used for
+  `XSECURELOCK_KEY_<name>_COMMAND`): keysymdef.h and XF86keysym.h, first
+  name of a value as libX11; `U%04lX`/`U%06lX` for other Unicode keysyms.
+- **Keycodes** up to 247 (X keycode 255); above that X has none either.
+- **Modifier state** of key events: X's modifier map (Shift, Control, Mod1
+  for Alt, Mod4 for Super, ...) for the keys held, Lock and Mod2 from the
+  LEDs, the console's locks and latches, the group in bits 13-14.
+- **Autorepeat** is X's: the kernel's repeats are dropped, and a held key
+  that repeats under X (per the keymap's interpretations: not modifiers or
+  lock keys) repeats after 660 ms every 40 ms (xserver
+  XkbDfltRepeatDelay/Interval), as a KeyRelease and KeyPress pair each time,
+  which is what a client gets without detectable autorepeat (xsecurelock does
+  not ask for it). The user's console repeat rate (kbdrate) is not used.
+
+## Colours
+
+`XAllocNamedColor` resolves a spec as libX11 and the X server do: Xcms first
+(lowercased; `#rgb`, `#rrggbb`, `#rrrgggbbb`, `#rrrrggggbbbb` and
+`rgb:r/g/b` with 1 to 4 hex digits as libX11's XcmsLRGB_RGB_ParseString,
+`rgbi:r/g/b` in [0, 1]), then the server's colour names (xserver
+os/oscolor.c, its table copied; case-insensitive). The pixel is the nearest of
+the console's 16 colours (palette read with `GIO_CMAP`). Not supported: the
+device-independent Xcms spaces (CIEXYZ:, CIEuvY:, CIExyY:, CIELab:, CIELuv:,
+TekHVC:), which need Xcms's colour characterisation; `rgbi:` is scaled
+linearly where Xcms goes through the screen's intensity tables (equal at 0 and
+1). A spec that does not resolve gives 0 as under X, and the colours are set
+to black: auth_x11 does not check the result and would otherwise use
+uninitialised values.
+
+## Events
+
+Map/Unmap/ConfigureNotify of the main program's windows are queued when the
+change is made (an X server sends them after processing the request; the
+program reads them later either way). VisibilityNotify is always Unobscured
+and there are no FocusIn/FocusOut events: on the lock VT nothing else can map
+a window or take the keyboard. Consequences for main.c: its "someone
+overlapped the window" and "NotifyUngrab: reacquire grabs" branches are never
+taken; `XGetInputFocus` returns None, so the focus juggling in the grab retry
+loop (taken only if bringing the lock VT to the front fails) does nothing, and
+there is no focus to restore after unlocking.
+
 ## Implementation limits (not forced by X, kept small on purpose)
 
-- At most 64 windows and 128 atoms in the shared table, 256 queued events in
-  the main program (xsecurelock uses a handful of each). Overflows are logged
-  (windows) or dropped (events, atoms).
+- At most 64 windows and 128 atoms in the shared table (xsecurelock uses a
+  handful of each). Overflows are logged (windows) or refused (atoms).
 - Two XKB groups at most: the base table and the AltGr-lock table, the model
   of keymaps like ruwin_cplk. Keymaps that switch layouts with other kernel
   locks (ShiftL_Lock, CtrlL_Lock, ...) show one layout.
