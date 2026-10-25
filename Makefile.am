@@ -154,8 +154,12 @@ helpers_PROGRAMS += \
 saver_matrix_SOURCES = \
 	xconsole/saver_matrix.c \
 	xconsole/saver_proto.h
-saver_matrix_CPPFLAGS = -D_GNU_SOURCE $(VTERM_CFLAGS)
-saver_matrix_LDADD = $(VTERM_LIBS)
+saver_matrix_CPPFLAGS = -D_GNU_SOURCE $(VTERM_CFLAGS) $(FREETYPE_CFLAGS) \
+	-DRAIN_FONT=\"$(raindir)/rain-font.otf\"
+saver_matrix_LDADD = $(VTERM_LIBS) $(FREETYPE_LIBS)
+# The rain's glyphs (scripts/gen-rain-font.py) and their licence.
+raindir = $(datadir)/ttysecurelock
+dist_rain_DATA = xconsole/rain/rain-font.otf xconsole/rain/OFL.txt
 endif
 
 if !CONSOLE

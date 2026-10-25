@@ -162,7 +162,35 @@ the session's. saver_matrix colours each trail (a vertical run of cmatrix's
 characters) by age: its newest cell (the head) gets level 0, the cells above
 it levels 1 to 5 by their distance from the head over the trail's length,
 so the oldest cells at the top are the darkest; a cell whose character
-changes in place keeps its age. It never sees the lock VT: its terminal is the pty, where nothing is
+changes in place keeps its age.
+
+Characters: as in the film, mirrored half-width katakana, digits and kanji.
+cmatrix draws ASCII (its `-c` draws CJK punctuation U+3000-303F, not
+katakana); saver_matrix keeps its digits and shows its other characters as
+katakana (7 in 10) or kanji, chosen per character and cell. The glyphs are
+in `xconsole/rain/rain-font.otf` (installed in `$(datadir)/ttysecurelock`):
+a 53 KB subset, made by `scripts/gen-rain-font.py`, of Noto Sans CJK JP
+Medium (SIL Open Font License 1.1, `xconsole/rain/OFL.txt`; Reserved Font
+Name "Source", which the subset does not use): the 56 half-width katakana
+U+FF66-FF9D and the 240 kanji of grades 1-2 of the kyouiku kanji (MEXT's
+gakunenbetsu kanji haitou hyou, as listed on English Wikipedia,
+`xconsole/rain/kanji.txt`; it includes 日, the film's one kanji).
+saver_matrix renders them with FreeType at the console font's cell size
+(the lock sends it), mirrored, katakana at their size, kanji squeezed to the
+cell's width (3/4 of its height), and sends them (`XC_SAVER_FONT`). The lock
+builds the rain font from the lock VT's own font (read with KDFONTOP and
+GIO_UNIMAP at lock start): every glyph of it, the saver's in slots no ASCII
+character uses and in new slots up to 512, and its Unicode map plus the
+saver's characters. The console writes a wide character (kanji) into two
+cells, so the lock writes each kanji as a private-use alias U+E000 + k that
+the rain font maps to the same glyph (/dev/vcsu then reads the alias). It
+loads the rain font (KDFONTOP and PIO_UNIMAP, on the lock VT only) while the
+saver shows, and puts the console font and map back: when the prompt is
+about to show (the process mapping the auth window asks the lock's thread
+through the channel and waits until it is done, as only the main program
+may load fonts), when the thread sees the prompt, and on unlock. A killed
+lock leaves the rain font only on its own VT. Without the font file, or if
+the lock refuses the glyphs, the rain stays ASCII. It never sees the lock VT: its terminal is the pty, where nothing is
 typed. If the pty closes (saver_matrix killed), cmatrix gets SIGHUP; it also
 has SIGTERM as parent-death signal. When the window's size changes (a rotated
 console), saver_matrix starts a new cmatrix on a new pty of the new size:

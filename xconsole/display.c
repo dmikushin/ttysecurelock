@@ -435,7 +435,8 @@ void XcPaintGridLocked(const XcWindow *w, int cols, int rows,
       cur_fg = fg;
       cur_bg = bg;
     }
-    len += PutUtf8(buf + len, XcPrintableCell(g->cp) ? g->cp : ' ');
+    uint32_t cp = XcRainAliasLocked(g->cp);
+    len += PutUtf8(buf + len, XcPrintableCell(cp) ? cp : ' ');
     at_c = c + 1;
     at_r = r;
   }
@@ -602,6 +603,7 @@ static Display *OpenMain(void) {
   }
   fcntl(sv[0], F_SETFD, FD_CLOEXEC);
   xc.saver_fd = sv[0];
+  XcSaverSaveFont();
   ScreenSize();
   unsigned char cmap[48];
   if (ioctl(xc.vt_fd, GIO_CMAP, cmap) == 0) {
@@ -848,6 +850,9 @@ int XDestroyWindow(Display *dpy, Window w) {
 }
 
 static int SetMapped(Window w, int mapped, int raise) {
+  // The prompt is about to show: the lock VT gets the console font back
+  // first (only the main program may load fonts; saver.c).
+  if (mapped && w == xc.shm->auth_window) XcRainFontOffForPrompt();
   XcLock();
   XcWindow *win = XcFindWindow(w);
   if (win == NULL) {

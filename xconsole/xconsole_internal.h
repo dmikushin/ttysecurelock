@@ -92,6 +92,8 @@ typedef struct {
   // Whether the lock VT's palette entries 1-6 hold the saver's green ramp
   // (display.c, XcSetRampLocked).
   int ramp_on;
+  // Whether the lock VT has the saver's font (saver.c, XcRainFontLocked).
+  int rain_font;
 } XcShared;
 
 //! Per-process connection.
@@ -157,6 +159,16 @@ int XcPrintableCell(uint32_t cp);
 
 // saver.c: saver modules draw into their saver window through the lock.
 int XcSaverServerStart(void);  // main program, after dropping privileges
+//! Main program, at XOpenDisplay: keep the lock VT's font and Unicode map.
+void XcSaverSaveFont(void);
+//! The saver's font on the lock VT (on), or the console's back (off).
+void XcRainFontLocked(int on);
+//! The code point to write for a saver cell's (a one-cell alias of a wide
+//! character of the rain font while it is loaded), else cp.
+uint32_t XcRainAliasLocked(uint32_t cp);
+//! Any process: the prompt is about to show; returns once the lock VT has
+//! the console font again (or after 2 s).
+void XcRainFontOffForPrompt(void);
 void XcSaverServerStop(void);
 
 // keyboard.c

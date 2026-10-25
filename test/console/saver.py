@@ -83,7 +83,8 @@ def screen(vt, with_bg=False):
     if with_bg:
         bgs = [VGA_TO_ANSI[(cells[2 * i + 1] >> (4 + shift)) & 7]
                for i in range(rows * cols)]
-        lit = [cells[2 * i] != 32 for i in range(rows * cols)]
+        # Lit from vcsu: with a 512-glyph font a glyph's low byte may be 32.
+        lit = [c not in " \0" for c in text]
         return text, fgs, cols, bgs, lit
     return text, fgs, cols
 
@@ -110,6 +111,180 @@ def trails(vt):
             mono += all(a >= b for a, b in zip(lv, lv[1:])) and 99 not in lv
             heads += lv[-1] == 0
     return runs, mono, heads
+
+
+GIO_UNIMAP, KD_FONT_OP_GET_TALL = 0x4B66, 5
+HERE = os.path.dirname(os.path.abspath(__file__))
+KANJI = set("".join(open(os.path.join(HERE, "..", "..", "xconsole", "rain",
+                                      "kanji.txt")).read().split()))
+KATAKANA = {chr(c) for c in range(0xFF66, 0xFF9E)}
+RAIN_FONT = "/usr/local/share/ttysecurelock/rain-font.otf"
+
+
+def vt_font(vt):
+    """(width, height, charcount, glyph bytes) of a VT's font."""
+    import ctypes
+    buf = ctypes.create_string_buffer(512 * 128 * 8)
+    fd = os.open(f"/dev/tty{vt}", os.O_RDONLY | os.O_NOCTTY)
+    try:
+        # GET_TALL lays glyphs out with the height asked for: size first.
+        op = bytearray(struct.pack("IIIIIP", KD_FONT_OP_GET_TALL, 0, 64, 128,
+                                   512, 0))
+        fcntl.ioctl(fd, KDFONTOP, op)
+        _, _, w, h, n, _ = struct.unpack("IIIIIP", op)
+        op = bytearray(struct.pack("IIIIIP", KD_FONT_OP_GET_TALL, 0, w, h,
+                                   512, ctypes.addressof(buf)))
+        fcntl.ioctl(fd, KDFONTOP, op)
+    finally:
+        os.close(fd)
+    _, _, w, h, n, _ = struct.unpack("IIIIIP", op)
+    return w, h, n, buf.raw[:n * h * ((w + 7) // 8)]
+
+
+def vt_unimap(vt):
+    """The VT's Unicode map as a sorted list of (code point, glyph)."""
+    import ctypes
+    entries = (ctypes.c_ushort * (2 * 65535))()
+    desc = bytearray(struct.pack("HxxxxxxP", 65535, ctypes.addressof(entries)))
+    fd = os.open(f"/dev/tty{vt}", os.O_RDONLY | os.O_NOCTTY)
+    try:
+        fcntl.ioctl(fd, GIO_UNIMAP, desc)
+    finally:
+        os.close(fd)
+    n = struct.unpack_from("H", desc)[0]
+    return sorted((entries[2 * i], entries[2 * i + 1]) for i in range(n))
+
+
+def glyph_bits(font, slot):
+    w, h, n, data = font
+    pitch = (w + 7) // 8
+    g = data[slot * h * pitch:(slot + 1) * h * pitch]
+    return [[bool(g[y * pitch + x // 8] & (0x80 >> (x % 8))) for x in range(w)]
+            for y in range(h)]
+
+
+def render(ch, w, h):
+    """The half-width katakana ch rendered unmirrored the way saver_matrix
+    renders it (pixel size 2w, centred, threshold 112), with PIL."""
+    from PIL import Image, ImageDraw, ImageFont
+    f = ImageFont.truetype(RAIN_FONT, 2 * w)
+    l, t, r, b = f.getbbox(ch)
+    im = Image.new("L", (r - l, b - t), 0)
+    ImageDraw.Draw(im).text((-l, -t), ch, font=f, fill=255)
+    out = [[False] * w for _ in range(h)]
+    x0, y0 = (w - im.width) // 2, (h - im.height) // 2
+    for y in range(im.height):
+        for x in range(im.width):
+            if 0 <= x0 + x < w and 0 <= y0 + y < h and \
+                    im.getpixel((x, y)) >= 112:
+                out[y0 + y][x0 + x] = True
+    return out
+
+
+def iou(a, b):
+    """Best overlap of a and b moved by up to 2 pixels (PIL and FreeType
+    place a glyph a pixel apart now and then)."""
+    h, w = len(a), len(a[0])
+    best = 0.0
+    for dy in range(-2, 3):
+        for dx in range(-2, 3):
+            m = [[0 <= y - dy < h and 0 <= x - dx < w and b[y - dy][x - dx]
+                  for x in range(w)] for y in range(h)]
+            best = max(best, iou0(a, m))
+    return best
+
+
+def iou0(a, b):
+    inter = sum(x and y for ra, rb in zip(a, b) for x, y in zip(ra, rb))
+    union = sum(x or y for ra, rb in zip(a, b) for x, y in zip(ra, rb))
+    return inter / union if union else 0.0
+
+
+def rain_glyphs(vt, name):
+    """The rain shows katakana and kanji, from the lock VT's font, mirrored,
+    and the framebuffer shows those glyphs in their cells."""
+    text, fgs, cols, bgs, lit = screen(vt, with_bg=True)
+    font = vt_font(vt)
+    umap = dict(vt_unimap(vt))
+    # Kanji are written as private-use aliases of their glyph (the console
+    # would give a wide character two cells); vcs names the alias: resolve it
+    # through the Unicode map to the kanji with the same glyph.
+    by_slot = {pos: chr(cp) for cp, pos in umap.items() if chr(cp) in KANJI}
+    def resolve(ch):
+        if 0xE000 <= ord(ch) < 0xE200 and umap.get(ord(ch)) in by_slot:
+            return by_slot[umap[ord(ch)]]
+        return ch
+    text = [resolve(ch) for ch in text]
+    shown = [ch for ch, l in zip(text, lit) if l]
+    kata = sum(ch in KATAKANA for ch in shown)
+    kan = sum(ch in KANJI for ch in shown)
+    dig = sum(ch.isdigit() for ch in shown)
+    other = sum(not (ch in KATAKANA or ch in KANJI or ch.isdigit())
+                for ch in shown)
+    check(f"{name}: the rain is katakana, kanji and digits (vcsu)",
+          kata > 50 and kan > 10 and other <= 0.02 * len(shown),
+          f"{kata} katakana, {kan} kanji, {dig} digits, {other} other "
+          f"{sorted({hex(ord(ch)) for ch in shown if not (ch in KATAKANA or ch in KANJI or ch.isdigit())})[:8]}")
+    w, h = font[0], font[1]
+    scores = []
+    # Full-size, asymmetric katakana (small ones and ｰ ｪ are near-symmetric).
+    for ch in "ｦｱｲｳｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃ":
+        g = glyph_bits(font, umap[ord(ch)]) if ord(ch) in umap else None
+        if g is None:
+            scores.append((ch, None, None))
+            continue
+        plain = render(ch, w, h)
+        mirror = [row[::-1] for row in plain]
+        scores.append((ch, iou(g, mirror), iou(g, plain)))
+    ok = all(m is not None and m >= 0.9 and m > p + 0.1 for _, m, p in scores)
+    check(f"{name}: the lock VT's katakana glyphs are mirrored renderings",
+          ok, " ".join(f"{c}:{m:.2f}/{p:.2f}" if m is not None else f"{c}:none"
+                       for c, m, p in scores))
+    # The framebuffer shows the glyph of the cell's character.
+    if not os.path.exists("/dev/fb0"):
+        return
+    stride = int(open("/sys/class/graphics/fb0/stride").read())
+    good = bad = 0
+    for _ in range(3):
+        a = screen(vt, with_bg=True)
+        with open("/dev/fb0", "rb") as f:
+            fb = f.read()
+        b = screen(vt, with_bg=True)
+        if not os.path.exists(f"/tmp/saver-rain-{name[:5]}.png"):
+            try:  # the screen as it was, for people to look at
+                from PIL import Image
+                fw, fh = map(int, open("/sys/class/graphics/fb0/virtual_size")
+                             .read().split(","))
+                Image.frombytes("RGB", (fw, fh), fb[:fh * stride], "raw",
+                                "BGRX", stride).save(
+                                    f"/tmp/saver-rain-{name[:5]}.png")
+            except Exception as e:  # noqa: BLE001
+                print(f"INFO  no screenshot: {e}")
+        for i, ch in enumerate(a[0]):
+            ch = resolve(ch)
+            if ch not in KATAKANA and ch not in KANJI:
+                continue
+            if (resolve(b[0][i]), b[1][i]) != (ch, a[1][i]) or \
+                    ord(ch) not in umap:
+                continue
+            g = glyph_bits(font, umap[ord(ch)])
+            r, c = divmod(i, cols)
+            bgc = pal0_g[a[3][i]]
+            match = True
+            for y in range(h):
+                o = (r * h + y) * stride + c * w * 4
+                for x in range(w):
+                    px = (fb[o + 4 * x + 2], fb[o + 4 * x + 1], fb[o + 4 * x])
+                    if g[y][x] == (px == bgc):
+                        match = False
+            good += match
+            bad += not match
+    check(f"{name}: the framebuffer shows those glyphs (no hole boxes)",
+          good > 20 and bad <= 0.05 * (good + bad), f"{good} cells match, "
+          f"{bad} do not")
+
+
+pal0_g = None
 
 
 def palette():
@@ -243,6 +418,9 @@ def main():
         sys.exit("cmatrix is not installed")
     orig_vt = s.active_vt()
     pal0 = palette()
+    global pal0_g
+    pal0_g = pal0
+    font12, map12 = vt_font(s.VT), vt_unimap(s.VT)
     subprocess.run(["useradd", "-m", "-s", "/usr/bin/nologin", "-c",
                     "ttysecurelock saver test", USER], check=True)
     home = pwd.getpwnam(USER).pw_dir
@@ -271,6 +449,9 @@ def main():
             if fg in RAMP else None,
             "rain: the screen shows the ramp's six greens (framebuffer)",
             limit=100000, cover=RAMP_RGB)
+        rain_glyphs(lock_vt, "idle")
+        check("rain: VT 12 keeps its font and Unicode map meanwhile",
+              vt_font(s.VT) == font12 and vt_unimap(s.VT) == map12)
 
         # 1b. A rotated console (fbcon rotation changes the VT's size): the
         # rain fills the new screen.
@@ -360,12 +541,17 @@ def main():
                                         pal0[bg]),
             "prompt: the console's own colours, the ramp undone "
             "(framebuffer)")
+        check("prompt: the lock VT has the console font again (KDFONTOP)",
+              vt_font(lock_vt) == font12)
+        check("prompt: ... and the console's Unicode map (GIO_UNIMAP)",
+              vt_unimap(lock_vt) == map12)
 
         # 3. Back after the auth timeout.
         time.sleep(AUTH_TIMEOUT + 3 - 3.0)  # the prompt checks took 3 s
         check("after the auth timeout the prompt is gone",
               USER not in "".join(screen(lock_vt)[0]))
         rain_shows(lock_vt, "after the auth timeout")
+        rain_glyphs(lock_vt, "after the auth timeout")
 
         # 6. Killing the saver.
         # cmatrix first: killing saver_matrix takes cmatrix with it.
@@ -396,6 +582,8 @@ def main():
         time.sleep(0.5)
         check("right password: the lock exits 0", rc == 0, f"exit {rc}")
         check("... the console palette (GIO_CMAP) is as before", palette() == pal0)
+        check("... VT 12's font and Unicode map are as before",
+              vt_font(s.VT) == font12 and vt_unimap(s.VT) == map12)
         check("... back on the locked VT", s.active_vt() == s.VT,
               f"VT {s.active_vt()}")
         time.sleep(1.0)

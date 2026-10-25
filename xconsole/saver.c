@@ -33,7 +33,10 @@ limitations under the License.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/kd.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../logging.h"
@@ -51,6 +54,243 @@ typedef struct {
   uint64_t damage;
   int hidden;  // blanked while the prompt shows
 } Conn;
+
+// ---------------------------------------------------------------------------
+// The rain font: the saver's glyphs on the lock VT while it shows.
+
+typedef struct {
+  struct console_font_op op;  // charcount, width, height, data
+  size_t size;
+  struct unipair *map;
+  unsigned short nmap;
+} VtFont;
+
+static VtFont console_font;  // the lock VT's own, kept at XOpenDisplay
+static VtFont rain_font;     // the console font with the saver's glyphs
+
+// The console writes a wide character (kanji) into two cells; the rain's are
+// one cell wide. Such characters are written as a private-use alias
+// (U+E000 + k) that the rain font maps to the same glyph; GIO_UNIMAP's
+// inverse (vcs) still names the character itself, the lower code point.
+#define ALIAS_BASE 0xe000
+static uint32_t alias_cp[XC_SAVER_MAX_GLYPHS];  // sorted
+static unsigned nalias;
+
+uint32_t XcRainAliasLocked(uint32_t cp) {
+  if (!xc.shm->rain_font) return cp;
+  unsigned lo = 0, hi = nalias;
+  while (lo < hi) {
+    unsigned mid = (lo + hi) / 2;
+    if (alias_cp[mid] < cp) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo < nalias && alias_cp[lo] == cp ? ALIAS_BASE + lo : cp;
+}
+
+//! Whether the saver may keep cp in a cell: printable in one cell, or one
+//! of its own glyphs.
+static int Keepable(uint32_t cp) {
+  if (XcPrintableCell(cp)) return 1;
+  for (unsigned k = 0; k < nalias; ++k) {
+    if (alias_cp[k] == cp) return 1;
+  }
+  return 0;
+}
+
+static size_t FontSize(unsigned count, unsigned width, unsigned height) {
+  return (size_t)count * height * ((width + 7) / 8);
+}
+
+void XcSaverSaveFont(void) {
+  VtFont *f = &console_font;
+  unsigned char *data = malloc(FontSize(512, 64, 128));
+  struct unipair *map = malloc(sizeof(*map) * 65535);
+  if (data == NULL || map == NULL) {
+    free(data);
+    free(map);
+    return;
+  }
+  // GET_TALL lays the glyphs out with the height asked for: ask for the
+  // font's size first, then for its glyphs at that height.
+  memset(&f->op, 0, sizeof(f->op));
+  f->op.op = KD_FONT_OP_GET_TALL;
+  f->op.width = 64;
+  f->op.height = 128;
+  f->op.charcount = 512;
+  f->op.data = NULL;
+  int sized = ioctl(xc.vt_fd, KDFONTOP, &f->op) == 0;
+  f->op.op = KD_FONT_OP_GET_TALL;
+  f->op.charcount = 512;
+  f->op.data = data;
+  struct unimapdesc ud = {65535, map};
+  if (!sized || ioctl(xc.vt_fd, KDFONTOP, &f->op) < 0 ||
+      ioctl(xc.vt_fd, GIO_UNIMAP, &ud) < 0) {
+    LogErrno("xconsole: reading the console font (no rain font)");
+    free(data);
+    free(map);
+    f->op.data = NULL;
+    return;
+  }
+  f->size = FontSize(f->op.charcount, f->op.width, f->op.height);
+  f->map = map;
+  f->nmap = ud.entry_ct;
+}
+
+static int LoadFont(const VtFont *f) {
+  struct console_font_op op = f->op;
+  op.op = KD_FONT_OP_SET_TALL;
+  op.flags = 0;
+  struct unimapinit init = {0, 0, 0};
+  struct unimapdesc ud = {f->nmap, f->map};
+  if (ioctl(xc.vt_fd, KDFONTOP, &op) < 0 ||
+      ioctl(xc.vt_fd, PIO_UNIMAPCLR, &init) < 0 ||
+      ioctl(xc.vt_fd, PIO_UNIMAP, &ud) < 0) {
+    LogErrno("xconsole: loading a font on the lock VT");
+    return 0;
+  }
+  return 1;
+}
+
+void XcRainFontLocked(int on) {
+  if (xc.shm->rain_font == on) return;
+  if (on && rain_font.op.data == NULL) return;
+  if (!on) {
+    // The console font back: failing that the prompt would show the rain's
+    // glyphs, so retry; the flag says what the VT has.
+    for (int tries = 0; tries < 3; ++tries) {
+      if (LoadFont(&console_font)) {
+        xc.shm->rain_font = 0;
+        return;
+      }
+    }
+    return;
+  }
+  if (LoadFont(&rain_font)) {
+    xc.shm->rain_font = 1;
+  } else {
+    LoadFont(&console_font);
+  }
+}
+
+void XcRainFontOffForPrompt(void) {
+  if (!xc.shm->rain_font) return;
+  if (xc.is_main) {
+    XcLock();
+    XcRainFontLocked(0);
+    XcUnlock();
+    return;
+  }
+  // Asked again every 100 ms (a datagram may not get through), for up to
+  // 2 s: the thread answers within a tick.
+  uint32_t m = XC_SAVER_PROMPT;
+  for (int i = 0; i < 1000 && xc.shm->rain_font; ++i) {
+    if (i % 50 == 0) {
+      send(xc.saver_fd, &m, sizeof(m), MSG_NOSIGNAL | MSG_DONTWAIT);
+    }
+    struct timespec ts = {0, 2000000};
+    nanosleep(&ts, NULL);
+  }
+  if (xc.shm->rain_font) Log("xconsole: the rain font is still loaded");
+}
+
+/*! \brief The rain font: the console font, with the saver's glyphs in slots
+ * that no ASCII character uses (and in new slots up to 512), and a Unicode
+ * map sending the saver's code points there. While it is loaded only the
+ * rain shows; the prompt gets the console font back first. */
+static int MakeRainFont(const XcSaverFont *h, const uint32_t *cps,
+                        const unsigned char *glyphs) {
+  const VtFont *cf = &console_font;
+  if (cf->op.data == NULL || h->width != cf->op.width ||
+      h->height != cf->op.height || h->n == 0 ||
+      h->n > XC_SAVER_MAX_GLYPHS) {
+    return 0;
+  }
+  static unsigned char ascii[512];
+  memset(ascii, 0, sizeof(ascii));
+  for (unsigned k = 0; k < cf->nmap; ++k) {
+    if (cf->map[k].unicode < 0x80 && cf->map[k].fontpos < 512) {
+      ascii[cf->map[k].fontpos] = 1;
+    }
+  }
+  ascii[0] = 1;
+  static unsigned short slot[XC_SAVER_MAX_GLYPHS];
+  static unsigned char taken[512];
+  memset(taken, 0, sizeof(taken));
+  unsigned n = 0;
+  for (int pos = 511; pos >= 0 && n < h->n; --pos) {
+    if ((unsigned)pos >= cf->op.charcount || !ascii[pos]) {
+      slot[n++] = (unsigned short)pos;
+      taken[pos] = 1;
+    }
+  }
+  if (n < h->n) return 0;
+  for (unsigned k = 0; k < h->n; ++k) {
+    if (cps[k] < 0x80 || cps[k] > 0xffff ||
+        (cps[k] >= ALIAS_BASE && cps[k] < ALIAS_BASE + XC_SAVER_MAX_GLYPHS)) {
+      return 0;
+    }
+  }
+  size_t glyph = FontSize(1, h->width, h->height);
+  unsigned char *data = calloc(1, FontSize(512, h->width, h->height));
+  struct unipair *map = malloc(sizeof(*map) * ((size_t)cf->nmap + 2 * h->n));
+  if (data == NULL || map == NULL) {
+    free(data);
+    free(map);
+    return 0;
+  }
+  memcpy(data, cf->op.data, cf->size);
+  for (unsigned k = 0; k < h->n; ++k) {
+    memcpy(data + slot[k] * glyph, glyphs + k * glyph, glyph);
+  }
+  unsigned m = 0;
+  for (unsigned k = 0; k < cf->nmap; ++k) {
+    if (cf->map[k].fontpos < 512 && taken[cf->map[k].fontpos]) continue;
+    int dup = 0;
+    for (unsigned j = 0; j < h->n && !dup; ++j) {
+      dup = cf->map[k].unicode == cps[j];
+    }
+    if (!dup) map[m++] = cf->map[k];
+  }
+  for (unsigned k = 0; k < h->n; ++k) {
+    map[m].unicode = (unsigned short)cps[k];
+    map[m++].fontpos = slot[k];
+  }
+  // Aliases for the wide ones, in code point order.
+  nalias = 0;
+  for (unsigned k = 0; k < h->n; ++k) {
+    if (!XcPrintableCell(cps[k])) {
+      unsigned at = nalias++;
+      while (at > 0 && alias_cp[at - 1] > cps[k]) {
+        alias_cp[at] = alias_cp[at - 1];
+        --at;
+      }
+      alias_cp[at] = cps[k];
+    }
+  }
+  for (unsigned a = 0; a < nalias; ++a) {
+    for (unsigned k = 0; k < h->n; ++k) {
+      if (cps[k] == alias_cp[a]) {
+        map[m].unicode = (unsigned short)(ALIAS_BASE + a);
+        map[m++].fontpos = slot[k];
+        break;
+      }
+    }
+  }
+  free(rain_font.op.data);
+  free(rain_font.map);
+  rain_font.op = cf->op;
+  rain_font.op.charcount = 512;
+  rain_font.op.data = data;
+  rain_font.size = FontSize(512, h->width, h->height);
+  rain_font.map = map;
+  rain_font.nmap = (unsigned short)m;
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
 
 static Conn conns[MAX_CONNS];
 static int nconns;
@@ -94,7 +334,8 @@ static void CloseConn(int i) {
 }
 
 static int SendSize(Conn *c) {
-  XcSaverSize m = {XC_SAVER_SIZE, (uint32_t)c->cols, (uint32_t)c->rows};
+  XcSaverSize m = {XC_SAVER_SIZE, (uint32_t)c->cols, (uint32_t)c->rows,
+                   (uint32_t)xc.shm->cell_w, (uint32_t)xc.shm->cell_h};
   return send(c->fd, &m, sizeof(m), MSG_NOSIGNAL | MSG_DONTWAIT) ==
          (ssize_t)sizeof(m);
 }
@@ -132,7 +373,10 @@ static int UpdateConn(Conn *c) {
   // on, the lock keeps its cells and shows them when the prompt is gone.
   XcWindow *auth = XcFindWindow(xc_auth_window);
   int hide = auth != NULL && XcViewable(auth);
-  if (hide) XcSetRampLocked(0);
+  if (hide) {
+    XcRainFontLocked(0);
+    XcSetRampLocked(0);
+  }
   if (hide && !c->hidden) {
     XcGridCell *blank = calloc((size_t)(c->cols * c->rows) + 1, sizeof(*blank));
     if (blank == NULL) return 0;
@@ -145,7 +389,9 @@ static int UpdateConn(Conn *c) {
     free(blank);
   }
   if (!hide && (c->hidden || c->damage != xc.shm->damage ||
-                !xc.shm->ramp_on)) {
+                !xc.shm->ramp_on ||
+                (rain_font.op.data != NULL && !xc.shm->rain_font))) {
+    XcRainFontLocked(1);
     XcSetRampLocked(1);
     XcPaintGridLocked(win, c->cols, c->rows, c->grid, NULL, -1);
   }
@@ -187,6 +433,13 @@ static void Accept(int srv) {
   }
   if (nfds >= 1) fd = fds[0];
   for (int k = 1; k < nfds; ++k) close(fds[k]);
+  if (n == (ssize_t)sizeof(uint32_t) && hello.magic == XC_SAVER_PROMPT) {
+    if (fd >= 0) close(fd);
+    XcLock();
+    XcRainFontLocked(0);
+    XcUnlock();
+    return;
+  }
   int type = 0;
   socklen_t tl = sizeof(type);
   pid_t parent = have_cred ? ParentOf(cred.pid) : 0;
@@ -231,6 +484,28 @@ static int Receive(int i, char *buf) {
   if (n < (ssize_t)sizeof(XcSaverCells) || n > XC_SAVER_MAX_MSG) return 0;
   XcSaverCells h;
   memcpy(&h, buf, sizeof(h));
+  if (h.type == XC_SAVER_FONT && n >= (ssize_t)sizeof(XcSaverFont)) {
+    XcSaverFont f;
+    memcpy(&f, buf, sizeof(f));
+    if (f.n > XC_SAVER_MAX_GLYPHS || f.width == 0 || f.width > 64 ||
+        f.height == 0 || f.height > 128 ||
+        (size_t)n != sizeof(f) + f.n * (sizeof(uint32_t) +
+                                         FontSize(1, f.width, f.height))) {
+      return 0;
+    }
+    XcLock();
+    int ok = !stopping && MakeRainFont(&f, (const uint32_t *)(buf + sizeof(f)),
+                                       (const unsigned char *)buf + sizeof(f) +
+                                           f.n * sizeof(uint32_t));
+    if (ok && xc.shm->rain_font) {  // a new font while one shows
+      xc.shm->rain_font = 0;
+      XcRainFontLocked(1);
+    }
+    XcUnlock();
+    XcSaverFontOk r = {XC_SAVER_FONT_OK, (uint32_t)ok};
+    return send(conns[i].fd, &r, sizeof(r), MSG_NOSIGNAL | MSG_DONTWAIT) ==
+           (ssize_t)sizeof(r);
+  }
   if (h.type != XC_SAVER_CELLS || h.n > XC_SAVER_MAX_CELLS ||
       (size_t)n != sizeof(h) + h.n * sizeof(XcSaverCell)) {
     return 0;
@@ -246,7 +521,7 @@ static int Receive(int i, char *buf) {
     if (cell.col >= c->cols || cell.row >= c->rows) continue;
     uint32_t idx = (uint32_t)cell.row * (uint32_t)c->cols + cell.col;
     XcGridCell *g = &c->grid[idx];
-    g->cp = XcPrintableCell(cell.cp) ? cell.cp : ' ';
+    g->cp = Keepable(cell.cp) ? cell.cp : ' ';
     g->fg = cell.fg < XC_SAVER_RAMP + XC_SAVER_RAMP_LEVELS ? cell.fg : 7;
     g->bg = cell.bg < XC_SAVER_RAMP + XC_SAVER_RAMP_LEVELS ? cell.bg : 0;
     list[m++] = idx;
@@ -314,6 +589,7 @@ int XcSaverServerStart(void) {
 void XcSaverServerStop(void) {
   XcLock();
   stopping = 1;
+  XcRainFontLocked(0);
   XcSetRampLocked(0);
   XcUnlock();
 }
