@@ -163,6 +163,7 @@ void XcRainFontLocked(int on) {
     for (int tries = 0; tries < 3; ++tries) {
       if (LoadFont(&console_font)) {
         xc.shm->rain_font = 0;
+        Log("xconsole: console font restored");
         return;
       }
     }
@@ -170,6 +171,7 @@ void XcRainFontLocked(int on) {
   }
   if (LoadFont(&rain_font)) {
     xc.shm->rain_font = 1;
+    Log("xconsole: rain font loaded");
   } else {
     LoadFont(&console_font);
   }
@@ -177,6 +179,8 @@ void XcRainFontLocked(int on) {
 
 void XcRainFontOffForPrompt(void) {
   if (!xc.shm->rain_font) return;
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
   if (xc.is_main) {
     XcLock();
     XcRainFontLocked(0);
@@ -193,7 +197,11 @@ void XcRainFontOffForPrompt(void) {
     struct timespec ts = {0, 2000000};
     nanosleep(&ts, NULL);
   }
-  if (xc.shm->rain_font) Log("xconsole: the rain font is still loaded");
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  Log("xconsole: prompt: rain font %s after %ld ms (pid %d)",
+      xc.shm->rain_font ? "STILL LOADED" : "off",
+      (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000),
+      (int)getpid());
 }
 
 /*! \brief The rain font: the console font, with the saver's glyphs in slots
@@ -327,10 +335,15 @@ static int InSaverWindow(Window w) {
   return 0;
 }
 
-static void CloseConn(int i) {
+static void CloseConn(int i, const char *why) {
+  Log("xconsole: saver connection %d closed: %s", i, why);
   close(conns[i].fd);
   free(conns[i].grid);
   conns[i] = conns[--nconns];
+  if (nconns == 0) {  // no saver: the console's own font and colours
+    XcRainFontLocked(0);
+    XcSetRampLocked(0);
+  }
 }
 
 static int SendSize(Conn *c) {
@@ -372,7 +385,7 @@ static int UpdateConn(Conn *c) {
   // box): while the prompt shows, the saver window is blank; the saver runs
   // on, the lock keeps its cells and shows them when the prompt is gone.
   XcWindow *auth = XcFindWindow(xc_auth_window);
-  int hide = auth != NULL && XcViewable(auth);
+  int hide = (auth != NULL && XcViewable(auth)) || xc.shm->prompt;
   if (hide) {
     XcRainFontLocked(0);
     XcSetRampLocked(0);
@@ -394,6 +407,10 @@ static int UpdateConn(Conn *c) {
     XcRainFontLocked(1);
     XcSetRampLocked(1);
     XcPaintGridLocked(win, c->cols, c->rows, c->grid, NULL, -1);
+  }
+  if (hide != c->hidden) {
+    Log("xconsole: saver %s", hide ? "hidden: the prompt shows"
+                                   : "shown again: the prompt is gone");
   }
   c->hidden = hide;
   c->damage = xc.shm->damage;
@@ -458,6 +475,8 @@ static void Accept(int srv) {
   int ok = !stopping && win != NULL && InSaverWindow(win->id) &&
            win->owner == parent;
   if (ok) {
+    Log("xconsole: saver pid %d connected, window %#lx", (int)cred.pid,
+        (unsigned long)win->id);
     Conn *c = &conns[nconns++];
     memset(c, 0, sizeof(*c));
     c->fd = fd;
@@ -549,7 +568,11 @@ static void *Serve(void *arg) {
     if (poll(pfd, (nfds_t)k + 1, TICK_MS) > 0) {
       for (int i = k - 1; i >= 0; --i) {
         if (pfd[i + 1].revents & (POLLIN | POLLERR | POLLHUP)) {
-          if (!Receive(i, buf)) CloseConn(i);
+          if (!Receive(i, buf)) {
+            XcLock();
+            CloseConn(i, "it left, or broke the protocol, or its window went");
+            XcUnlock();
+          }
         }
       }
       if (pfd[0].revents & POLLIN) Accept(xc.saver_fd);
@@ -557,7 +580,7 @@ static void *Serve(void *arg) {
     XcLock();
     int stop = stopping;
     for (int i = nconns - 1; !stop && i >= 0; --i) {
-      if (!UpdateConn(&conns[i])) CloseConn(i);
+      if (!UpdateConn(&conns[i])) CloseConn(i, "its window went");
     }
     XcUnlock();
     if (stop) break;

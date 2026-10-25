@@ -103,7 +103,7 @@ edit). Everything else happens behind the Xlib calls:
 | `XAllocNamedColor`, `XQueryColor`, `XFreeColors`, `XCreateGC`, `XFreeGC` | See "Colours". |
 | `XLoadQueryFont`, `XTextWidth`, `XDrawString` | The console font as a core font one cell wide; its height is a cell minus auth_x11's line spacing, so its lines are one row apart. Text is UTF-8, written to the cells under it where no window above covers them; a character takes the cells the console gives it (2 for double-width ones, 0 for combining marks). |
 | `XInternAtom` (with `only_if_exists`), `XGetAtomName`, `XChangeProperty`, `XSetWMProperties`, `XStringListToTextProperty`, `XAllocClassHint`, `XGetClassHint`, `XmuClientWindow`, `XFree` | Atoms in the shared table; window manager properties are accepted and ignored (there is no window manager). |
-| `XForceScreenSaver` | Blanks/unblanks the console (`TIOCL_BLANKSCREEN`). |
+| `XForceScreenSaver` | Blanks/unblanks the console (`TIOCLINUX` `TIOCL_BLANKSCREEN`/`TIOCL_UNBLANKSCREEN`; the kernel allows them on the caller's controlling tty only, so the lock VT is made the main program's controlling tty: it leads a session, as tty-i3-keys starts it, or calls setsid()). Key input unblanks it, as an X server does on input: main.c only notes that the screen is no longer blanked (ScreenNoLongerBlanked), and a console blanked this way ignores the keyboard until unblanked. The lock also unblanks at start, in case a lock died blanked. |
 | `XBell`, `XGetKeyboardControl`, `XChangeKeyboardControl` | `KDMKTONE` with the bell pitch and duration (XSECURELOCK_AUTH_SOUNDS). |
 | `XSetErrorHandler`, `XGetErrorText`, `XOpenIM`, `XCreateIC` | Trivial. |
 
@@ -316,6 +316,25 @@ overlapped the window" and "NotifyUngrab: reacquire grabs" branches are never
 taken; `XGetInputFocus` returns None, so the focus juggling in the grab retry
 loop (taken only if bringing the lock VT to the front fails) does nothing, and
 there is no focus to restore after unlocking.
+
+## Logging
+
+The lock logs to its stderr (the journal of tty-i3-keys, which starts it)
+one line per transition, besides upstream's own lines (`AUTH_TIMEOUT hit.`,
+`auth child failed with status 1.`, `saver child killed by signal 9.`):
+`xconsole: lock VT ttyN is our controlling tty`, `auth window mapped/
+unmapped (pid)`, `saver window mapped`, `key input while the prompt is not
+shown`, `console blanked/unblanked (why)` or the TIOCLINUX error, `saver
+pid P connected`, `saver connection closed: why`, `saver hidden: the prompt
+shows` / `shown again`, `green ramp on/off`, `rain font loaded` / `console
+font restored`, `prompt: rain font off after N ms`; saver_matrix logs each
+cmatrix it starts (pid, size) and how one ended.
+
+PAM: a prompt that times out ends its PAM conversation unanswered, which
+pam_faillock records as a failure (as under X). With Arch's defaults
+(deny=3 in 15 minutes, unlock_time 600) three prompt timeouts in 15
+minutes lock the account for 10 minutes, and the right password is refused
+meanwhile (`test/console/saver.py` shows the records with `faillock`).
 
 ## Implementation limits (not forced by X, kept small on purpose)
 

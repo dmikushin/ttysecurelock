@@ -389,6 +389,7 @@ void XcSetRampLocked(int on) {
   }
   Out(buf, len);
   xc.shm->ramp_on = on;
+  Log("xconsole: green ramp %s", on ? "on" : "off");
 }
 
 //! A saver cell's colour as a console colour: the ramp's entries while it
@@ -604,6 +605,10 @@ static Display *OpenMain(void) {
   fcntl(sv[0], F_SETFD, FD_CLOEXEC);
   xc.saver_fd = sv[0];
   XcSaverSaveFont();
+  // A console blanked with TIOCL_BLANKSCREEN ignores keys until unblanked
+  // (ignore_poke): if a lock died blanked, the screen stays dark. Start lit.
+  char unblank = TIOCL_UNBLANKSCREEN;
+  ioctl(xc.vt_fd, TIOCLINUX, &unblank);
   ScreenSize();
   unsigned char cmap[48];
   if (ioctl(xc.vt_fd, GIO_CMAP, cmap) == 0) {
@@ -721,6 +726,9 @@ static void CheckScreenSize(void) {
 
 //! Read all the keyboard input there is (waiting up to timeout_ms for
 //! some, less if a key repeat is due first), and queue the key repeats due.
+static int console_blanked;
+static void Blank(int on, const char *why);
+
 static void ReadInput(int timeout_ms) {
   int repeat_ms = XcKeyboardTimeoutMs();
   if (repeat_ms >= 0 && (timeout_ms < 0 || repeat_ms < timeout_ms)) {
@@ -731,6 +739,15 @@ static void ReadInput(int timeout_ms) {
     unsigned char buf[256];
     ssize_t n = read(xc.vt_fd, buf, sizeof(buf));
     if (n <= 0) break;
+    XcLock();
+    XcWindow *auth = XcFindWindow(xc_auth_window);
+    int prompt = auth != NULL && Viewable(auth);
+    XcUnlock();
+    if (!prompt) Log("xconsole: key input while the prompt is not shown");
+    // As an X server does, input unblanks the screen: main.c only notes it
+    // (ScreenNoLongerBlanked). The console does not: a screen blanked with
+    // TIOCL_BLANKSCREEN ignores the keyboard until unblanked.
+    if (console_blanked) Blank(0, "key input");
     XcKeyboardInput(dpy_ptr, buf, (size_t)n);
     timeout_ms = 0;
   }
@@ -852,7 +869,12 @@ int XDestroyWindow(Display *dpy, Window w) {
 static int SetMapped(Window w, int mapped, int raise) {
   // The prompt is about to show: the lock VT gets the console font back
   // first (only the main program may load fonts; saver.c).
-  if (mapped && w == xc.shm->auth_window) XcRainFontOffForPrompt();
+  if (w == xc.shm->auth_window) {
+    XcLock();
+    xc.shm->prompt = mapped;
+    XcUnlock();
+    if (mapped) XcRainFontOffForPrompt();
+  }
   XcLock();
   XcWindow *win = XcFindWindow(w);
   if (win == NULL) {
@@ -864,6 +886,11 @@ static int SetMapped(Window w, int mapped, int raise) {
   if (raise) win->stack = xc.shm->next_stack++;
   // The prompt shows: its colours are the console's, before it is painted.
   if (changed && mapped && w == xc.shm->auth_window) XcSetRampLocked(0);
+  if (changed && (w == xc.shm->auth_window || w == xc.shm->saver_window)) {
+    Log("xconsole: %s window %s (pid %d)",
+        w == xc.shm->auth_window ? "auth" : "saver",
+        mapped ? "mapped" : "unmapped", (int)getpid());
+  }
   if (changed || raise) RepaintWindowArea(win);
   if (changed && mapped && w == xc.shm->auth_window) {
     // The prompt shows: the saver window goes blank now, not when the saver
@@ -1729,14 +1756,20 @@ int XGetErrorText(Display *dpy, int code, char *buffer, int length) {
 
 /*! \brief Screen saver activation blanks the console (TIOCL_BLANKSCREEN on
  * the lock VT, our controlling tty); reset unblanks it. */
+static void Blank(int on, const char *why) {
+  char arg = on ? TIOCL_BLANKSCREEN : TIOCL_UNBLANKSCREEN;
+  if (ioctl(xc.vt_fd, TIOCLINUX, &arg) < 0) {
+    LogErrno("xconsole: TIOCLINUX %s (%s)", on ? "blank" : "unblank", why);
+    return;
+  }
+  console_blanked = on;
+  Log("xconsole: console %s (%s)", on ? "blanked" : "unblanked", why);
+}
+
 int XForceScreenSaver(Display *dpy, int mode) {
   (void)dpy;
   if (!xc.is_main) return 1;
-  char arg = mode == ScreenSaverActive ? TIOCL_BLANKSCREEN
-                                       : TIOCL_UNBLANKSCREEN;
-  if (ioctl(xc.vt_fd, TIOCLINUX, &arg) < 0) {
-    LogErrno("TIOCLINUX blank/unblank");
-  }
+  Blank(mode == ScreenSaverActive, "XForceScreenSaver");
   return 1;
 }
 

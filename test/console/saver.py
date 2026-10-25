@@ -44,6 +44,8 @@ from parity import font_shift  # noqa: E402
 
 USER, PASSWORD = s.USER, s.PASSWORD
 AUTH_TIMEOUT = 60  # the user's setting
+BLANK_TIMEOUT = 120  # upstream's default is 600; shorter for the test
+STDERR = "/tmp/ttysecurelock-saver.stderr"
 KDGKBMODE, K_MEDIUMRAW = 0x4B44, 2
 GIO_CMAP, KDFONTOP = 0x4B70, 0x4B72
 # The lock's green ramp (xconsole/display.c): palette entries 1-6 of the lock
@@ -368,6 +370,16 @@ def rain_stats(vt):
     return text, len(lit), len(green)
 
 
+def wait_for(pred, timeout, step=0.5):
+    """Poll pred until it holds or timeout seconds pass; its last value."""
+    end = time.time() + timeout
+    while True:
+        v = pred()
+        if v or time.time() > end:
+            return v
+        time.sleep(step)
+
+
 def cpu_ticks(pid):
     f = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
     return int(f[11]) + int(f[12])
@@ -384,7 +396,7 @@ def start_lock():
     proc = subprocess.Popen(
         ["env", "-i", "LANG=en_US.UTF-8", "PATH=/usr/local/bin:/usr/bin",
          s.TTYSECURELOCK, "--user", USER], start_new_session=True,
-        stderr=open("/tmp/ttysecurelock-saver.stderr", "a"))
+        stderr=open(STDERR, "a"))
     for _ in range(250):
         if s.active_vt() != s.VT:
             break
@@ -434,6 +446,7 @@ def main():
         s.as_user("sh", "-c", f"printf '%s\\n' '# test settings' "
                   f"'XSECURELOCK_SAVER=saver_matrix' "
                   f"'XSECURELOCK_AUTH_TIMEOUT=\"{AUTH_TIMEOUT}\"' "
+                  f"'XSECURELOCK_BLANK_TIMEOUT={BLANK_TIMEOUT}' "
                   f"'PATH=/nonexistent' > {conf}/environment")
         kb = s.keyboard()
         proc = start_lock()
@@ -526,7 +539,8 @@ def main():
 
         # 2. The prompt on top.
         s.chord(kb, s.SHIFT)
-        time.sleep(1.5)
+        wait_for(lambda: USER in "".join(screen(lock_vt)[0]), 5)
+        time.sleep(0.5)
         for k in range(3):
             text, lit, green = rain_stats(lock_vt)
             check(f"prompt shown ({k}): the user name is on the screen",
@@ -547,9 +561,10 @@ def main():
               vt_unimap(lock_vt) == map12)
 
         # 3. Back after the auth timeout.
-        time.sleep(AUTH_TIMEOUT + 3 - 3.0)  # the prompt checks took 3 s
+        time.sleep(AUTH_TIMEOUT - 10)
         check("after the auth timeout the prompt is gone",
-              USER not in "".join(screen(lock_vt)[0]))
+              wait_for(lambda: USER not in "".join(screen(lock_vt)[0]), 15))
+        time.sleep(1.0)
         rain_shows(lock_vt, "after the auth timeout")
         rain_glyphs(lock_vt, "after the auth timeout")
 
@@ -566,6 +581,57 @@ def main():
         time.sleep(1.5)
         check("... the prompt still shows",
               USER in "".join(screen(lock_vt)[0]))
+
+        # 6b. Long use, as on yoga3: the prompt times out, the lock stays
+        # idle until XSECURELOCK_BLANK_TIMEOUT blanks the console (and stops
+        # the saver), a key brings the prompt, it times out: the rain is
+        # back; and once more.
+        time.sleep(AUTH_TIMEOUT - 5)
+        wait_for(lambda: USER not in "".join(screen(lock_vt)[0]), 15)
+        time.sleep(1.0)
+        rain_shows(lock_vt, "cycle 1: the prompt timed out")
+        mark = os.path.getsize(STDERR)
+        time.sleep(BLANK_TIMEOUT + 5)
+        log = open(STDERR, errors="replace").read()[mark:]
+        check("blank timeout: the console is blanked",
+              "xconsole: console blanked" in log and "TIOCLINUX" not in log,
+              " | ".join(l[-80:] for l in log.splitlines()
+                         if "blank" in l.lower()))
+        check("... the saver is stopped meanwhile",
+              not pids_named(proc.pid, "cmatrix"))
+        check("... and the lock VT stays in front", s.still_locked(proc,
+                                                                  lock_vt))
+        for cycle in (2, 3):
+            mark = os.path.getsize(STDERR)
+            s.chord(kb, s.SHIFT)
+            check(f"cycle {cycle}: a key shows the prompt (within 5 s)",
+                  wait_for(lambda: USER in "".join(screen(lock_vt)[0]), 5))
+            if cycle == 2:
+                log = open(STDERR, errors="replace").read()[mark:]
+                check("cycle 2: the key unblanked the console",
+                      "console unblanked (key input)" in log)
+            time.sleep(AUTH_TIMEOUT - 5)
+            check(f"cycle {cycle}: the prompt timed out (within "
+                  f"{AUTH_TIMEOUT + 10} s)",
+                  wait_for(lambda: USER not in "".join(screen(lock_vt)[0]),
+                           15))
+            time.sleep(1.0)
+            rain_shows(lock_vt, f"cycle {cycle}: the prompt timed out")
+            rain_glyphs(lock_vt, f"cycle {cycle}")
+            log = open(STDERR, errors="replace").read()[mark:]
+            print("INFO  log: " + " | ".join(
+                l.split("xsecurelock: ")[-1][:70] for l in log.splitlines()),
+                flush=True)
+        # Each prompt that timed out was a failed PAM authentication: with
+        # pam_faillock (deny=3 by default) the account is now locked for a
+        # while, and the right password would be refused. Show it, then reset.
+        fl = subprocess.run(["faillock", "--user", USER], capture_output=True,
+                            text=True).stdout
+        print("INFO  faillock after the timeouts: " + " / ".join(
+            l.strip() for l in fl.splitlines()[1:]), flush=True)
+        subprocess.run(["faillock", "--user", USER, "--reset"])
+        s.chord(kb, s.SHIFT)
+        time.sleep(1.5)
 
         # 7. Passwords.
         s.chord(kb, s.KEY_A)
@@ -597,11 +663,20 @@ def main():
             fcntl.ioctl(kb, s.UI_DEV_DESTROY)
         for pid in s.lock_pids():
             os.kill(pid, signal.SIGKILL)
+            if proc is not None and pid == proc.pid:
+                proc.wait()  # a zombie would still own the VT
             time.sleep(0.3)
-            s.release_console()
+            try:
+                s.release_console()
+            except subprocess.TimeoutExpired:
+                print("INFO  chvt timed out")
         subprocess.run(["pkill", "-KILL", "-u", USER])
         time.sleep(0.5)
         subprocess.run(["faillock", "--user", USER, "--reset"])
+        # A lock killed while blanked leaves the console dark: unblank.
+        fd0 = os.open("/dev/tty0", os.O_RDWR | os.O_NOCTTY)
+        fcntl.ioctl(fd0, 0x541C, bytes([4]))  # TIOCLINUX, TIOCL_UNBLANKSCREEN
+        os.close(fd0)
         for _ in range(10):  # tty-i3-keys may run i3blocks for VT 12's owner
             subprocess.run(["pkill", "-KILL", "-u", USER])
             time.sleep(0.3)

@@ -150,15 +150,19 @@ int XcVtOpen(void) {
     Log("No free VT");
     return 0;
   }
-  // As a new session's leader, the lock VT becomes our controlling tty:
-  // that permits the console ioctls the display needs (blanking).
-  int ctty = setsid() >= 0;
+  // As a session's leader without a controlling tty, the lock VT becomes
+  // ours: that permits the console ioctls the display needs (blanking,
+  // TIOCLINUX). Started by tty-i3-keys (start_new_session) we already lead
+  // a session, and setsid() fails.
+  int ctty = setsid() >= 0 || getsid(0) == getpid();
   snprintf(path, sizeof(path), "/dev/tty%d", vt);
   xc.vt_fd = open(path, O_RDWR | O_CLOEXEC | (ctty ? 0 : O_NOCTTY));
   if (xc.vt_fd < 0) {
     LogErrno("open %s", path);
     return 0;
   }
+  Log("xconsole: lock VT tty%d %s our controlling tty", vt,
+      tcgetsid(xc.vt_fd) == getsid(0) ? "is" : "is NOT (no blanking)");
   // Helpers draw on the VT through this one; they cannot read from it.
   xc.draw_fd = open(path, O_WRONLY | O_NOCTTY);
   if (xc.draw_fd < 0) {

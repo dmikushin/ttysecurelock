@@ -341,6 +341,8 @@ static int Spawn(void) {
     execvp("cmatrix", argv_cmatrix);
     _exit(127);
   }
+  fprintf(stderr, "saver_matrix: pid %d started cmatrix pid %d (%d x %d)\n",
+          (int)getpid(), (int)child, cols, rows);
   return master;
 }
 
@@ -533,9 +535,12 @@ int main(int argc_main, char **argv_main) {
     if (p[0].revents & (POLLIN | POLLHUP | POLLERR)) {
       ssize_t n = read(master, buf, sizeof(buf));
       if (n <= 0) {
-        int status;
+        int status = 0;
         waitpid(child, &status, 0);
         child = 0;
+        fprintf(stderr, "saver_matrix: cmatrix %s %d\n",
+                WIFSIGNALED(status) ? "killed by signal" : "exited with status",
+                WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status));
         errno = ECHILD;
         Die("cmatrix exited");
       }

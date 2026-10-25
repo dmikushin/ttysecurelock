@@ -94,6 +94,9 @@ typedef struct {
   int ramp_on;
   // Whether the lock VT has the saver's font (saver.c, XcRainFontLocked).
   int rain_font;
+  // Set by the process about to map the auth window, until it unmaps it:
+  // the saver's font and colours stay off meanwhile (saver.c).
+  int prompt;
 } XcShared;
 
 //! Per-process connection.
