@@ -360,3 +360,25 @@ meanwhile (`test/console/saver.py` shows the records with `faillock`).
   window through it (not elsewhere, and never while the prompt shows).
 - `dimmer` and `until_nonidle` (pre-lock dimming and idle detection, both on
   X extensions) are not built.
+
+## pam_faillock and prompts that time out
+
+An auth prompt that times out (or is cancelled with Escape) aborts the PAM
+conversation: authproto_pam answers PAM_CONV_ERR, which pam_get_authtok turns
+into PAM_AUTHTOK_ERR, and Arch's system-auth (`[success=1 default=bad]
+pam_unix`) sends that to `pam_faillock authfail`. Three timeouts within 15
+minutes then locked the account for 10 minutes, the right password included.
+upstream xsecurelock under X behaves the same; no upstream code changes.
+
+Fix, at the PAM level, on all machines (consilium: gpt-6.1-sol and strata,
+docs/consilium/): in /etc/pam.d/system-auth
+
+    auth [success=1 authtok_err=die conv_err=die default=bad] pam_unix.so try_first_pass nullok
+
+An aborted prompt still fails the login (`die`), but skips authfail; a wrong
+password still counts; deny=3 and the shared per-user counter are unchanged.
+Applied with docs/consilium/pam-fix.sh, verified with the real authproto_pam
+by docs/consilium/pam-verify.sh: 3 cancels -> 0 failures, right password
+passes, wrong passwords count (2, then 3 -> locked), a cancel in between does
+not count, the right password is refused while locked. pambase owns the file:
+an upgrade of pambase leaves a .pacnew to merge by hand.
